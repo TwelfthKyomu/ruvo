@@ -1,0 +1,38 @@
+goroutine 652 [running]:
+runtime/pprof.writeGoroutineStacks({0x1048288a0, 0x3af5424c4870})
+	/usr/local/go/src/runtime/pprof/pprof.go:816 +0x6c
+net/http.(*conn).serve(0x3af5423f0000, {0x10482b000, 0x3af5423e4000})
+	/usr/local/go/src/net/http/server.go:2157 +0x5a0
+created by net/http.(*Server).Serve in goroutine 1
+	/usr/local/go/src/net/http/server.go:3564 +0x400
+
+goroutine 9 [sleep]:
+time.Sleep(0x1312d00)
+	/usr/local/go/src/runtime/time.go:368 +0x150
+main.(*pipeline).worker(0x3af5423e43c0)
+	/home/dev/leaky/pipeline.go:114 +0xb8
+created by main.newPipeline in goroutine 1
+	/home/dev/leaky/pipeline.go:64 +0x19c
+
+goroutine 35 [chan receive, 7 minutes] {kind: "a b", media_job: 42}:
+main.main.func1()
+	/home/dev/probe/main.go:13 +0x24
+created by main.main in goroutine 1
+	/home/dev/probe/main.go:13 +0x68
+
+goroutine 18 [IO wait, 2 minutes, locked to thread]:
+internal/poll.runtime_pollWait(0x14a1e0e00, 0x72)
+	/usr/local/go/src/runtime/netpoll.go:351 +0xa0
+...additional frames elided...
+net/http.(*connReader).backgroundRead(0x3af542420000)
+	/usr/local/go/src/net/http/server.go:746 +0x38
+created by net/http.(*connReader).startBackgroundRead in goroutine 17
+	/usr/local/go/src/net/http/server.go:742 +0xc8
+
+goroutine 40 [sync.Mutex.Lock]:
+sync.(*Mutex).Lock(...)
+	/usr/local/go/src/sync/mutex.go:73
+main.lockPair(0x3af5423e4400, 0x3af5423e4408, 0x3af5423e0060)
+	/home/dev/leaky/pipeline.go:195 +0x60
+created by main.handleDeadlock in goroutine 39
+	/home/dev/leaky/pipeline.go:170 +0x80

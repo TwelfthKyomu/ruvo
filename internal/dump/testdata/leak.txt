@@ -1,0 +1,4 @@
+goroutineleak profile: total 1390
+1390 @ 0x1042c8708 0x1042598a4 0x1044aa18c 0x1042cf744
+#	0x1044aa18b	main.notify+0x3b	/home/dev/leaky/pipeline.go:190
+

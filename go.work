@@ -1,0 +1,8 @@
+go 1.27
+
+use (
+	.
+	./flow
+	./cmd/ruvo
+	./examples/leaky
+)

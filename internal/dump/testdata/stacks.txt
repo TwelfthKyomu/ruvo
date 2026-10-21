@@ -1,0 +1,15 @@
+goroutine profile: total 26
+17 @ 0x1042c8708 0x10428b410 0x1042c7940 0x104302d48 0x1042cf744
+#	0x1042c793f	internal/poll.runtime_pollWait+0x9f		/usr/local/go/src/runtime/netpoll.go:351
+#	0x1043036dc	internal/poll.(*FD).Read+0x21c			/usr/local/go/src/internal/poll/fd_unix.go:170
+#	0x104459237	net/http.(*connReader).backgroundRead+0x37	/usr/local/go/src/net/http/server.go:746
+
+8 @ 0x1042c8708 0x1042cc500 0x1044a95c8 0x1042cf744
+#	0x1042cc4ff	time.Sleep+0x14f		/usr/local/go/src/runtime/time.go:368
+#	0x1044a95c7	main.(*pipeline).worker+0xb7	/home/dev/leaky/pipeline.go:114
+
+1 @ 0x1042c8708 0x1042a4058 0x1044a983f 0x10445e9b0 0x1042cf744
+# labels: {"media_job":"42"}
+#	0x1044a983f	main.(*pipeline).handleWork+0x23f	/home/dev/leaky/pipeline.go:145
+#	0x10445e9af	net/http.(*conn).serve+0x59f		/usr/local/go/src/net/http/server.go:2157
+

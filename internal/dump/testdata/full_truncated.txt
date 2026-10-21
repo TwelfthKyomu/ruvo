@@ -1,0 +1,18 @@
+goroutine 652 [running]:
+runtime/pprof.writeGoroutineStacks({0x1048288a0, 0x3af5424c4870})
+	/usr/local/go/src/runtime/pprof/pprof.go:816 +0x6c
+net/http.(*conn).serve(0x3af5423f0000, {0x10482b000, 0x3af5423e4000})
+	/usr/local/go/src/net/http/server.go:2157 +0x5a0
+created by net/http.(*Server).Serve in goroutine 1
+	/usr/local/go/src/net/http/server.go:3564 +0x400
+
+goroutine 9 [sleep]:
+time.Sleep(0x1312d00)
+	/usr/local/go/src/runtime/time.go:368 +0x150
+main.(*pipeline).worker(0x3af5423e43c0)
+	/home/dev/leaky/pipeline.go:114 +0xb8
+created by main.newPipeline in goroutine 1
+	/home/dev/leaky/pipeline.go:64 +0x19c
+
+goroutine 35 [chan receive]:
+main.main.func1()

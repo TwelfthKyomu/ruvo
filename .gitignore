@@ -1,0 +1,15 @@
+/dist/
+*.test
+*.out
+*.pprof
+*.trace
+.DS_Store
+.idea/
+.superpowers/
+.claude/
+spike/
+/cmd/ruvo/ruvo
+/ruvo
+/docs/
+CLAUDE.md
+AGENTS.md
