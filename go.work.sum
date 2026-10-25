@@ -1,3 +1,4 @@
+github.com/TwelfthKyomu/ruvo/flow v0.2.0/go.mod h1:MDEri1G0sEgAQEwNYoEp3JHlFRPv8N6z6emArVjR/xE=
 github.com/google/go-cmp v0.6.0 h1:ofyhxvXcZhMsU5ulbFiLKl/XBFqE1GSq7atu8tAmTRI=
 github.com/google/go-cmp v0.6.0/go.mod h1:17dUlkBOakJ0+DkrSSNjCkIjxS6bF9zb3elmeNGIjoY=
 golang.org/x/mod v0.42.0 h1:ICeL3t2L30ljSPHHxDnR4fqVcBt/zR2zJAb9juavmQg=
