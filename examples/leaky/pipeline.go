@@ -194,8 +194,8 @@ func lockPair(first, second *sync.Mutex, done chan<- struct{}) {
 	first.Lock()
 	time.Sleep(time.Millisecond)
 	second.Lock()
-	second.Unlock()
 	first.Unlock()
+	second.Unlock()
 	done <- struct{}{}
 }
 
