@@ -3,8 +3,8 @@ module github.com/TwelfthKyomu/ruvo/cmd/ruvo
 go 1.27
 
 require (
-	github.com/TwelfthKyomu/ruvo v0.2.0
-	github.com/TwelfthKyomu/ruvo/flow v0.2.0
+	github.com/TwelfthKyomu/ruvo v0.3.0
+	github.com/TwelfthKyomu/ruvo/flow v0.3.0
 )
 
 require golang.org/x/exp v0.0.0-20261014143641-f0251eb4aa3e // indirect
