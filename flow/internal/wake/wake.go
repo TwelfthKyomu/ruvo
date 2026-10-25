@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"runtime"
 	"slices"
 	"strconv"
@@ -16,6 +17,8 @@ import (
 )
 
 var errMalformed = errors.New("malformed trace")
+
+const dumpRange = "stop-the-world (all goroutines stack trace)"
 
 var systemReasons = map[string]bool{
 	"system goroutine wait":        true,
@@ -52,17 +55,34 @@ type edge struct {
 	wait    time.Duration
 }
 
+type wakeup struct {
+	id     trace.GoID
+	waker  *stack
+	cause  string
+	reason string
+	since  trace.Time
+	at     trace.Time
+	later  bool
+}
+
 type parser struct {
-	stacks map[int64][]ruvo.Frame
-	dumped map[int64]*stack
-	traced map[trace.Stack]*stack
-	keys   map[string]*stack
-	buf    []byte
-	gs     map[trace.GoID]*goroutine
-	edges  map[edgeKey]*edge
-	start  trace.Time
-	syncs  int
-	later  int
+	stacks  map[int64][]ruvo.Frame
+	dumped  map[int64]*stack
+	traced  map[trace.Stack]*stack
+	keys    map[string]*stack
+	buf     []byte
+	gs      map[trace.GoID]*goroutine
+	edges   map[edgeKey]*edge
+	still   map[*stack]*edge
+	pending []wakeup
+	unknown map[string]int
+	start   trace.Time
+	end     trace.Time
+	stw     trace.Time
+	dumpAt  trace.Time
+	dumpEnd trace.Time
+	syncs   int
+	later   int
 }
 
 func Read(r io.Reader, stacks map[int64][]ruvo.Frame) ([]ruvo.Wakeup, error) {
@@ -80,12 +100,14 @@ func read(r io.Reader, stacks map[int64][]ruvo.Frame) (ws []ruvo.Wakeup, unknown
 	}
 
 	a := &parser{
-		stacks: stacks,
-		dumped: map[int64]*stack{},
-		traced: map[trace.Stack]*stack{},
-		keys:   map[string]*stack{},
-		gs:     map[trace.GoID]*goroutine{},
-		edges:  map[edgeKey]*edge{},
+		stacks:  stacks,
+		dumped:  map[int64]*stack{},
+		traced:  map[trace.Stack]*stack{},
+		keys:    map[string]*stack{},
+		gs:      map[trace.GoID]*goroutine{},
+		edges:   map[edgeKey]*edge{},
+		still:   map[*stack]*edge{},
+		unknown: map[string]int{},
 	}
 
 	for {
@@ -101,10 +123,15 @@ func read(r io.Reader, stacks map[int64][]ruvo.Frame) (ws []ruvo.Wakeup, unknown
 		a.event(ev)
 	}
 
+	a.settle()
+	a.stuck()
+
 	return a.wakeups(), a.later, nil
 }
 
 func (a *parser) event(ev trace.Event) {
+	a.end = ev.Time()
+
 	switch ev.Kind() {
 	case trace.EventSync:
 		if a.syncs == 0 {
@@ -113,6 +140,10 @@ func (a *parser) event(ev trace.Event) {
 
 		a.syncs++
 		clear(a.traced)
+
+		return
+	case trace.EventRangeBegin, trace.EventRangeEnd:
+		a.rangeEvent(ev)
 
 		return
 	case trace.EventStateTransition:
@@ -181,47 +212,85 @@ func (a *parser) block(g *goroutine, s *stack, reason string, since trace.Time) 
 	}
 }
 
+func (a *parser) rangeEvent(ev trace.Event) {
+	if ev.Range().Name != dumpRange {
+		return
+	}
+
+	if ev.Kind() == trace.EventRangeBegin {
+		a.stw = ev.Time()
+		return
+	}
+
+	if a.stw != 0 {
+		a.dumpAt, a.dumpEnd, a.stw = a.stw, ev.Time(), 0
+	}
+}
+
 func (a *parser) wake(id trace.GoID, ev trace.Event) {
 	g := a.track(id)
 	if g.system {
 		return
 	}
 
-	waiter, reason, since := g.wait, g.reason, g.since
+	waiter := g.wait
+	w := wakeup{id: id, cause: ruvo.CauseTimer, reason: g.reason, since: g.since, at: ev.Time()}
 	g.blocked, g.wait, g.reason, g.since = false, nil, "", 0
 
-	if waiter == nil {
-		waiter = a.fromDump(id)
+	if wg := ev.Goroutine(); wg != trace.NoGoroutine {
+		if w.waker = a.waker(wg, ev); w.waker == nil || w.waker.system {
+			return
+		}
+
+		w.cause = ruvo.CauseGoroutine
 	}
 
 	if waiter == nil {
-		if a.syncs > 1 {
-			a.later++
-		}
+		w.later = a.syncs > 1
+		a.pending = append(a.pending, w)
 
 		return
 	}
 
+	a.record(w, waiter)
+}
+
+func (a *parser) dumpedWait(id trace.GoID, since, until trace.Time) *stack {
+	if a.dumpEnd == 0 || since > a.dumpAt || until < a.dumpEnd {
+		return nil
+	}
+
+	return a.fromDump(id)
+}
+
+func (a *parser) settle() {
+	for _, w := range a.pending {
+		waiter := a.dumpedWait(w.id, w.since, w.at)
+		if waiter == nil {
+			a.unknown[w.cause]++
+
+			if w.later {
+				a.later++
+			}
+
+			continue
+		}
+
+		a.record(w, waiter)
+	}
+}
+
+func (a *parser) record(w wakeup, waiter *stack) {
 	if waiter.system {
 		return
 	}
 
-	cause := ruvo.CauseTimer
-
-	var waker *stack
-
-	switch w := ev.Goroutine(); {
-	case w != trace.NoGoroutine:
-		if waker = a.waker(w, ev); waker == nil || waker.system {
-			return
-		}
-
-		cause = ruvo.CauseGoroutine
-	case reason == "network", reason == "" && waiter.net:
+	cause := w.cause
+	if cause == ruvo.CauseTimer && (w.reason == "network" || w.reason == "" && waiter.net) {
 		cause = ruvo.CauseNetwork
 	}
 
-	k := edgeKey{cause: cause, waker: waker, waiter: waiter}
+	k := edgeKey{cause: cause, waker: w.waker, waiter: waiter}
 
 	e := a.edges[k]
 	if e == nil {
@@ -230,10 +299,40 @@ func (a *parser) wake(id trace.GoID, ev trace.Event) {
 	}
 
 	e.count++
-	e.waiters[id] = struct{}{}
+	e.waiters[w.id] = struct{}{}
 
-	if d := ev.Time().Sub(max(since, a.start)); d > 0 {
+	if d := w.at.Sub(max(w.since, a.start)); d > 0 {
 		e.wait += d
+	}
+}
+
+func (a *parser) stuck() {
+	for id, g := range a.gs {
+		if !g.blocked || g.system || g.since > a.start {
+			continue
+		}
+
+		waiter := g.wait
+		if waiter == nil {
+			waiter = a.dumpedWait(id, g.since, a.end)
+		}
+
+		if waiter == nil || waiter.system {
+			continue
+		}
+
+		e := a.still[waiter]
+		if e == nil {
+			e = &edge{waiters: map[trace.GoID]struct{}{}}
+			a.still[waiter] = e
+		}
+
+		e.count++
+		e.waiters[id] = struct{}{}
+
+		if d := a.end.Sub(max(g.since, a.start)); d > 0 {
+			e.wait += d
+		}
 	}
 }
 
@@ -335,7 +434,7 @@ func (a *parser) wakeups() []ruvo.Wakeup {
 		ps = append(ps, pair{k, e})
 	}
 
-	slices.SortFunc(ps, func(x, y pair) int {
+	order := func(x, y pair) int {
 		return cmp.Or(
 			cmp.Compare(y.e.wait, x.e.wait),
 			cmp.Compare(y.e.count, x.e.count),
@@ -343,12 +442,22 @@ func (a *parser) wakeups() []ruvo.Wakeup {
 			strings.Compare(key(x.k.waker), key(y.k.waker)),
 			strings.Compare(key(x.k.waiter), key(y.k.waiter)),
 		)
-	})
+	}
 
-	ws := make([]ruvo.Wakeup, len(ps))
+	slices.SortFunc(ps, order)
 
-	for i, p := range ps {
-		ws[i] = ruvo.Wakeup{
+	still := make([]pair, 0, len(a.still))
+
+	for s, e := range a.still {
+		still = append(still, pair{edgeKey{cause: ruvo.CauseNone, waiter: s}, e})
+	}
+
+	slices.SortFunc(still, order)
+
+	ws := make([]ruvo.Wakeup, 0, len(ps)+len(still)+len(a.unknown))
+
+	for _, p := range append(ps, still...) {
+		w := ruvo.Wakeup{
 			Cause:   p.k.cause,
 			Waiter:  p.k.waiter.frames,
 			Count:   p.e.count,
@@ -357,8 +466,14 @@ func (a *parser) wakeups() []ruvo.Wakeup {
 		}
 
 		if p.k.waker != nil {
-			ws[i].Waker = p.k.waker.frames
+			w.Waker = p.k.waker.frames
 		}
+
+		ws = append(ws, w)
+	}
+
+	for _, cause := range slices.Sorted(maps.Keys(a.unknown)) {
+		ws = append(ws, ruvo.Wakeup{Cause: cause, Count: a.unknown[cause]})
 	}
 
 	return ws

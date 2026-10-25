@@ -12,10 +12,12 @@ type fullState struct {
 	groups map[string]fullGroup
 	bySite map[string]fullGroup
 	seen   map[int64]seenAt
+	ids    []string
 	maxID  int64
 	spawns map[[2]endpoint]int
 	count  int
 	cut    bool
+	raw    []byte
 }
 
 type fullGroup struct {
@@ -30,94 +32,132 @@ func (g fullGroup) calls(fn string) bool {
 }
 
 type seenAt struct {
-	group string
-	at    time.Time
+	group int32
+	at    int64
+}
+
+type stackInfo struct {
+	own   bool
+	group int32
 }
 
 func (f *fullState) update(at time.Time, gs []dump.Goroutine) {
-	states := map[string]map[string]int{}
-	groups := map[string]fullGroup{}
-	ends := map[string]endpoint{}
-	seen := map[int64]seenAt{}
+	type tally struct {
+		fg     fullGroup
+		end    endpoint
+		states map[string]int
+	}
 
-	var top int64
+	var (
+		tallies []tally
+		top     int64
+	)
 
+	index := map[string]int32{}
+	infos := map[*dump.Frame]stackInfo{}
+	seen := make(map[int64]seenAt, len(gs))
 	count := 0
+	now := at.UnixNano()
+
+	describe := func(frames []dump.Frame) stackInfo {
+		if isOwn(frames) {
+			return stackInfo{own: true}
+		}
+
+		site, entry := groupKey(frames)
+		id := groupID(site, entry)
+
+		i, ok := index[id]
+		if !ok {
+			i = int32(len(tallies))
+			index[id] = i
+			tallies = append(tallies, tally{
+				fg:     fullGroup{frames: frames},
+				end:    endpoint{id: id, site: site.String(), entry: entry.Func, calls: callList(frames)},
+				states: map[string]int{},
+			})
+		}
+
+		return stackInfo{group: i}
+	}
 
 	for _, g := range gs {
 		top = max(top, g.ID)
 
-		if isOwn(g.Frames) {
+		var info stackInfo
+
+		if len(g.Frames) == 0 {
+			info = describe(g.Frames)
+		} else if c, ok := infos[&g.Frames[0]]; ok {
+			info = c
+		} else {
+			info = describe(g.Frames)
+			infos[&g.Frames[0]] = info
+		}
+
+		if info.own {
 			continue
 		}
 
 		count++
 
-		site, entry := groupKey(g.Frames)
-		id := groupID(site, entry)
+		t := &tallies[info.group]
+		since := now
 
-		if _, ok := ends[id]; !ok {
-			ends[id] = endpoint{id: id, site: site.String(), entry: entry.Func}
-		}
-
-		since := at
-		if prev, ok := f.seen[g.ID]; ok && prev.group == id && g.Wait > 0 {
+		if prev, ok := f.seen[g.ID]; ok && g.Wait > 0 && f.ids[prev.group] == t.end.id {
 			since = prev.at
 		}
 
-		seen[g.ID] = seenAt{group: id, at: since}
-		waited := min(at.Sub(since), g.Wait+waitSlack)
+		seen[g.ID] = seenAt{group: info.group, at: since}
+		waited := min(time.Duration(now-since), g.Wait+waitSlack)
 
-		if states[id] == nil {
-			states[id] = map[string]int{}
+		t.states[g.State]++
+
+		if t.fg.createdBy == "" {
+			t.fg.createdBy = g.CreatedBy.String()
 		}
 
-		states[id][g.State]++
-
-		fg := groups[id]
-		if fg.createdBy == "" {
-			fg.createdBy = g.CreatedBy.String()
-		}
-
-		if fg.frames == nil {
-			fg.frames = g.Frames
-		}
-
-		fg.maxWait = max(fg.maxWait, g.Wait, waited)
-		groups[id] = fg
+		t.fg.maxWait = max(t.fg.maxWait, g.Wait, waited)
 	}
 
-	bySite := map[string]fullGroup{}
+	groups := make(map[string]fullGroup, len(tallies))
+	bySite := make(map[string]fullGroup, len(tallies))
+	ids := make([]string, len(tallies))
 	shared := map[string]bool{}
 
-	for id, fg := range groups {
-		fg.state = mostCommon(states[id])
-		groups[id] = fg
+	for i, t := range tallies {
+		t.fg.state = mostCommon(t.states)
+		groups[t.end.id] = t.fg
+		ids[i] = t.end.id
 
-		site := ends[id].site
-
-		if _, dup := bySite[site]; dup {
-			shared[site] = true
+		if _, dup := bySite[t.end.site]; dup {
+			shared[t.end.site] = true
 		}
 
-		bySite[site] = fg
+		bySite[t.end.site] = t.fg
 	}
 
 	for site := range shared {
 		delete(bySite, site)
 	}
 
+	ends := make([]endpoint, len(tallies))
+	for i, t := range tallies {
+		ends[i] = t.end
+	}
+
 	f.at = at
 	f.groups = groups
 	f.bySite = bySite
 	f.seen = seen
+	f.ids = ids
 	f.maxID = top
 	f.count = count
 	f.spawns = spawnPairs(gs, seen, ends)
 }
 
-func spawnPairs(gs []dump.Goroutine, seen map[int64]seenAt, ends map[string]endpoint) map[[2]endpoint]int {
-	pairs := map[[2]string]int{}
+func spawnPairs(gs []dump.Goroutine, seen map[int64]seenAt, ends []endpoint) map[[2]endpoint]int {
+	pairs := map[[2]int32]int{}
 
 	for _, g := range gs {
 		if g.Creator == 0 {
@@ -130,7 +170,7 @@ func spawnPairs(gs []dump.Goroutine, seen map[int64]seenAt, ends map[string]endp
 		}
 
 		if creator, ok := seen[g.Creator]; ok {
-			pairs[[2]string{creator.group, child.group}]++
+			pairs[[2]int32{creator.group, child.group}]++
 		}
 	}
 
@@ -158,6 +198,7 @@ func mostCommon(counts map[string]int) string {
 type leakState struct {
 	at     time.Time
 	counts map[string]int
+	raw    []byte
 }
 
 func (l *leakState) update(at time.Time, p dump.Profile) {

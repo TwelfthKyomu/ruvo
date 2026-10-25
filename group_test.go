@@ -16,14 +16,12 @@ import (
 func readProfile(t *testing.T, name string) dump.Profile {
 	t.Helper()
 
-	f, err := os.Open("internal/dump/testdata/" + name)
+	b, err := os.ReadFile("internal/dump/testdata/" + name)
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	defer f.Close()
-
-	p, err := dump.ParseStacks(f)
+	p, err := dump.ParseStacks(b)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -248,7 +246,7 @@ func TestLocalTraceReaderHidden(t *testing.T) {
 			t.Fatal(err)
 		}
 
-		p, err = dump.ParseStacks(bytes.NewReader(raw))
+		p, err = dump.ParseStacks(raw)
 		if err != nil {
 			t.Fatal(err)
 		}

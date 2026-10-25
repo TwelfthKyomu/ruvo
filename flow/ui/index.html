@@ -167,6 +167,26 @@
             display: block;
         }
 
+        a.button {
+            font: inherit;
+            padding: 4px 10px;
+            border: 1px solid var(--line);
+            border-radius: 6px;
+            background: var(--panel);
+            color: var(--accent);
+            text-decoration: none;
+        }
+
+        a.button:hover {
+            background: var(--hover);
+        }
+
+        .banner.info {
+            background: var(--panel);
+            color: var(--text);
+            border: 1px solid var(--line);
+        }
+
         main {
             padding: 16px 20px 40px;
         }
@@ -454,6 +474,10 @@
             stroke-dasharray: 5 4;
         }
 
+        .edge.approx .line {
+            stroke-dasharray: 2 4;
+        }
+
         .edge.jam .line {
             stroke: var(--jam);
         }
@@ -552,6 +576,7 @@
         <span class="stat dim" id="updated">connecting…</span>
         <span class="stat"><span id="trace">trace: never</span> <button id="traceBtn" type="button">Record trace (5 s)</button></span>
         <label class="stat check"><input type="checkbox" id="spawn"> spawn</label>
+        <span class="stat"><a class="button" id="export" href="api/export" download title="Save what this page shows, with the dumps and the trace behind it, as a zip file; open it again with ruvo -open">Export</a></span>
         <span class="note" id="note"></span>
     </div>
 </header>
@@ -643,7 +668,7 @@
         const t = Date.parse(at);
         if (isNaN(t)) return null;
         const base = Date.parse(snap.at);
-        return isNaN(base) ? Date.now() - t : base - t + (Date.now() - received);
+        return isNaN(base) ? Date.now() - t : base - t + (snap.offline ? 0 : Date.now() - received);
     }
 
     function seconds(ns) {
@@ -805,6 +830,9 @@
         const bad = rest.filter((g) => g.leaked > 0 || g.growthPerMin > 0);
         bad.sort((a, b) => (b.leaked || 0) - (a.leaked || 0) || (b.growthPerMin || 0) - (a.growthPerMin || 0) || bySize(a, b));
         for (const g of bad) add(g.id);
+        const stuck = rest.filter((g) => g.unwoken > 0);
+        stuck.sort((a, b) => b.unwoken - a.unwoken || bySize(a, b));
+        for (const g of stuck) add(g.id);
         for (const g of rest) {
             if (chosen.length >= LIMIT) break;
             add(g.id);
@@ -984,9 +1012,10 @@
             const lift = spawn && pairs.has(e.from + " " + e.to) ? 12 : 0;
             const g = geometry(lay.at.get(e.from), lay.at.get(e.to), lift, HEADS[size][1] * 0.6);
             const cls = e === red ? "jam" : spawn ? "spawn" : "edge";
-            const box = sv("g", {class: "edge " + cls});
+            const box = sv("g", {class: "edge " + cls + (e.approx ? " approx" : "")});
             const text = who(e.from, m) + " → " + who(e.to, m) + "\n";
-            box.append(sv("title", {}, text + (spawn ? "started " + e.count + (e.count === 1 ? " goroutine" : " goroutines") : "wakes " + handoff(e))));
+            const note = e.approx ? "\nmatched by wait site or start function: the group it was recorded for is gone" : "";
+            box.append(sv("title", {}, text + (spawn ? "started " + e.count + (e.count === 1 ? " goroutine" : " goroutines") : "wakes " + handoff(e)) + note));
             box.append(sv("path", {class: "hit", d: g.d}));
             const line = sv("path", {class: "line", d: g.d, "stroke-width": r(w), "marker-end": head(cls, size)});
             box.append(line);
@@ -1018,21 +1047,23 @@
 
     function badges(n, g, s, m) {
         const list = [];
-        if (g.id === m.jam) list.push(["jam", "alert"]);
-        if (g.leaked > 0) list.push(["leaked " + g.leaked, "bad"]);
-        if (g.growthPerMin > 0) list.push([grow(g.growthPerMin) + "/min", "bad"]);
+        if (g.id === m.jam) list.push(["jam", "alert", "Waited for the most: its goroutines spent " + approx(s.wait / snap.traceFor) + " goroutine-seconds per second waiting for the wakeups seen in the trace"]);
+        if (g.leaked > 0) list.push(["leaked " + g.leaked, "bad", "Found by the goroutineleak profile: blocked forever"]);
+        if (g.growthPerMin > 0) list.push([grow(g.growthPerMin) + "/min", "bad", "Growth over the last two minutes"]);
+        if (g.unwoken > 0) list.push(["not woken " + g.unwoken, "", g.unwoken + " of them waited through the whole trace: nothing woke them, so they have no arrow"]);
         if (s.wait > 0) {
             for (const c of ["network", "timer"]) {
                 const f = s[c] / s.wait;
-                if (f >= 0.2) list.push([c + " " + Math.round(f * 100) + "%", ""]);
+                if (f >= 0.2) list.push([c + " " + Math.round(f * 100) + "%", "", "Share of their waiting ended by the " + c + " rather than by a goroutine"]);
             }
         }
-        if (s.self) list.push(["wakes itself " + num(rate(s.self)) + "/s", ""]);
+        if (s.self) list.push(["wakes itself " + num(rate(s.self)) + "/s", "", "Goroutines of this group wake each other"]);
         let x = 10;
-        for (const [text, cls] of list) {
+        for (const [text, cls, hint] of list) {
             const w = measure(text, BADGE) + 14;
             if (x > 10 && x + w > NW - 8) break;
             const b = sv("g", {class: "badge " + cls, transform: "translate(" + r(x) + "," + (NH - 8) + ")"});
+            b.append(sv("title", {}, hint));
             b.append(sv("rect", {width: r(w), height: 16, rx: 8}));
             b.append(sv("text", {x: r(w / 2), y: 11.5, "text-anchor": "middle"}, text));
             n.append(b);
@@ -1157,6 +1188,7 @@
             ["Waiting", wait(g), g.inFullDump ? "num" : "dim"],
             ["Growth/min", gr[0], gr[1]],
             ["Leaked", g.leaked ? String(g.leaked) : "—", g.leaked ? "num bad" : "dim"],
+            ["Not woken in trace", g.unwoken ? String(g.unwoken) : "—", g.unwoken ? "num" : "dim"],
         ];
         for (const [k, v, cls] of rows) dl.append(el("dt", "", k), el("dd", cls, v));
     }
@@ -1213,6 +1245,7 @@
     function banner() {
         if (lost) return "Lost connection to ruvo — retrying…";
         if (!snap) return "";
+        if (snap.offline) return "Opened from a file: this is what ruvo saw at " + new Date(snap.at).toLocaleString() + ". Nothing reads the target, so the actions are off.";
         if (snap.error) return "Cannot read the target: " + snap.error;
         const quiet = Date.now() - fresh;
         if (quiet > Math.max(3 * snap.interval / 1e6, 15000)) return "No new data for " + ago(quiet).replace(" ago", "") + ".";
@@ -1224,13 +1257,17 @@
         const b = $("banner");
         b.textContent = text;
         b.classList.toggle("on", text !== "");
-        $("hint").hidden = !!(snap && snap.traceAt);
+        b.classList.toggle("info", !lost && !!(snap && snap.offline));
+        $("hint").hidden = !!(snap && (snap.traceAt || snap.offline));
         if (!snap) return;
         $("target").textContent = snap.target || "";
         $("count").textContent = count(snap.goroutines);
-        $("updated").textContent = "updated " + ago(Date.now() - fresh);
+        $("updated").textContent = snap.offline ? "taken " + new Date(snap.at).toLocaleString() : "updated " + ago(Date.now() - fresh);
+        if (snap.offline) $("traceBtn").disabled = true;
         const t = since(snap.traceAt);
-        $("trace").textContent = "trace: " + (t === null ? "never" : ago(t) + (snap.traceFor > 0 ? " · " + seconds(snap.traceFor) : ""));
+        const unknown = snap.traceUnknown > 0 ? " · " + count(snap.traceUnknown) + " unknown" : "";
+        $("trace").textContent = "trace: " + (t === null ? "never" : ago(t) + (snap.traceFor > 0 ? " · " + seconds(snap.traceFor) : "") + unknown);
+        $("trace").title = unknown ? count(snap.traceUnknown) + " wakeups have no arrow: where those goroutines waited is not known" : "";
         document.title = "ruvo · flow · " + (snap.target || "");
     }
 
@@ -1249,8 +1286,8 @@
     }
 
     function show(s) {
-        if (snap && Date.parse(s.at) < Date.parse(snap.at)) return;
-        if (!snap || s.at !== snap.at) fresh = Date.now();
+        if (snap && s.seq < snap.seq) return;
+        if (!snap || s.seq !== snap.seq) fresh = Date.now();
         snap = s;
         received = Date.now();
         lost = false;

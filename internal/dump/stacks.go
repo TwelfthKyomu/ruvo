@@ -1,11 +1,9 @@
 package dump
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
-	"io"
-	"strconv"
-	"strings"
 )
 
 type Record struct {
@@ -18,20 +16,23 @@ type Profile struct {
 	Records []Record
 }
 
-func ParseStacks(r io.Reader) (Profile, error) {
-	sc := newScanner(r)
+func ParseStacks(data []byte) (Profile, error) {
+	var in Strings
 
-	if !sc.Scan() {
-		if err := sc.Err(); err != nil {
-			return Profile{}, err
-		}
+	return in.ParseStacks(data)
+}
 
+func (in *Strings) ParseStacks(data []byte) (Profile, error) {
+	ls := lines{data: data}
+
+	first, ok := ls.next()
+	if !ok {
 		return Profile{}, errors.New("dump: empty profile")
 	}
 
-	total, ok := parseTotal(sc.Text())
+	total, ok := parseTotal(first)
 	if !ok {
-		return Profile{}, fmt.Errorf("dump: not a debug=1 profile: %s", quote(sc.Text()))
+		return Profile{}, fmt.Errorf("dump: not a debug=1 profile: %s", quote(first))
 	}
 
 	if total < 0 {
@@ -39,36 +40,57 @@ func ParseStacks(r io.Reader) (Profile, error) {
 	}
 
 	p := Profile{Total: total}
+	strs := in.ready()
 	cur := -1
 	sum := 0
 
-	for sc.Scan() {
-		line := sc.Text()
+	var frames []Frame
+
+	flush := func() {
+		if cur >= 0 && len(frames) > 0 {
+			p.Records[cur].Frames = append([]Frame(nil), frames...)
+		}
+
+		frames = frames[:0]
+	}
+
+	for {
+		line, ok := ls.next()
+		if !ok {
+			break
+		}
 
 		switch {
-		case line == "":
+		case len(line) == 0:
+			flush()
 			cur = -1
-		case strings.HasPrefix(line, "# labels:"):
-		case strings.HasPrefix(line, "#"):
-			if f, ok := parseStackFrame(line); ok && cur >= 0 {
-				p.Records[cur].Frames = append(p.Records[cur].Frames, f)
+		case line[0] == '#':
+			if cur < 0 || bytes.HasPrefix(line, []byte("# labels:")) {
+				continue
+			}
+
+			if f, ok := parseStackFrame(line, strs); ok {
+				frames = append(frames, f)
 			}
 		default:
-			if n, ok := parseCount(line); ok {
-				if n < 1 {
-					return Profile{}, fmt.Errorf("dump: bad record count: %s", quote(line))
-				}
-
-				sum += n
-				p.Records = append(p.Records, Record{Count: n})
-				cur = len(p.Records) - 1
+			n, ok := parseCount(line)
+			if !ok {
+				continue
 			}
+
+			if n < 1 {
+				return Profile{}, fmt.Errorf("dump: bad record count: %s", quote(line))
+			}
+
+			flush()
+
+			sum += n
+			p.Records = append(p.Records, Record{Count: n})
+			cur = len(p.Records) - 1
 		}
 	}
 
-	if err := sc.Err(); err != nil {
-		return Profile{}, err
-	}
+	flush()
 
 	if sum != total {
 		return Profile{}, fmt.Errorf("dump: incomplete profile: %d of %d goroutines", sum, total)
@@ -77,51 +99,59 @@ func ParseStacks(r io.Reader) (Profile, error) {
 	return p, nil
 }
 
-func parseTotal(line string) (int, bool) {
-	name, n, ok := strings.Cut(line, " profile: total ")
-	if !ok || (name != "goroutine" && name != "goroutineleak") {
+func parseTotal(line []byte) (int, bool) {
+	name, n, ok := bytes.Cut(line, []byte(" profile: total "))
+	if !ok || (string(name) != "goroutine" && string(name) != "goroutineleak") {
 		return 0, false
 	}
 
-	total, err := strconv.Atoi(strings.TrimSpace(n))
-
-	return total, err == nil
+	return signedAtoi(bytes.TrimSpace(n))
 }
 
-func parseCount(line string) (int, bool) {
-	n, rest, ok := strings.Cut(line, " @")
-	if !ok || (rest != "" && rest[0] != ' ') {
+func parseCount(line []byte) (int, bool) {
+	n, rest, ok := bytes.Cut(line, []byte(" @"))
+	if !ok || (len(rest) > 0 && rest[0] != ' ') {
 		return 0, false
 	}
 
-	count, err := strconv.Atoi(n)
-
-	return count, err == nil
+	return signedAtoi(n)
 }
 
-func parseStackFrame(line string) (Frame, bool) {
-	var fields []string
+func parseStackFrame(line []byte, in Strings) (Frame, bool) {
+	var fields [4][]byte
 
-	for _, f := range strings.Split(line, "\t") {
-		if f != "" {
-			fields = append(fields, f)
+	n := 0
+
+	for len(line) > 0 && n < 4 {
+		i := bytes.IndexByte(line, '\t')
+
+		var f []byte
+		if i < 0 {
+			f, line = line, nil
+		} else {
+			f, line = line[:i], line[i+1:]
+		}
+
+		if len(f) > 0 {
+			fields[n] = f
+			n++
 		}
 	}
 
-	if len(fields) < 4 {
+	if n < 4 {
 		return Frame{}, false
 	}
 
 	fn := fields[2]
 
-	if i := strings.LastIndex(fn, "+0x"); i >= 0 {
+	if i := bytes.LastIndex(fn, []byte("+0x")); i >= 0 {
 		fn = fn[:i]
 	}
 
-	file, n, ok := parseFileLine(fields[3])
+	file, ln, ok := parseFileLine(fields[3])
 	if !ok {
 		return Frame{}, false
 	}
 
-	return Frame{Func: fn, File: file, Line: n}, true
+	return Frame{Func: in.str(fn), File: in.str(file), Line: ln}, true
 }

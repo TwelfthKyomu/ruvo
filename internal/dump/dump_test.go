@@ -1,24 +1,22 @@
 package dump
 
 import (
+	"bytes"
 	"os"
 	"reflect"
-	"strings"
 	"testing"
 	"time"
 )
 
-func open(t *testing.T, name string) *os.File {
+func open(t testing.TB, name string) []byte {
 	t.Helper()
 
-	f, err := os.Open("testdata/" + name)
+	b, err := os.ReadFile("testdata/" + name)
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	t.Cleanup(func() { f.Close() })
-
-	return f
+	return b
 }
 
 func TestParseStacks(t *testing.T) {
@@ -68,29 +66,29 @@ func TestParseStacksRejectsDamaged(t *testing.T) {
 		"zero count":     "goroutine profile: total 0\n0 @ 0x1\n",
 		"negative count": "goroutine profile: total 1\n-1 @ 0x1\n2 @ 0x2\n",
 	} {
-		if _, err := ParseStacks(strings.NewReader(body)); err == nil {
+		if _, err := ParseStacks([]byte(body)); err == nil {
 			t.Errorf("%s: want error", name)
 		}
 	}
 
-	p, err := ParseStacks(strings.NewReader("goroutine profile: total 0\n"))
+	p, err := ParseStacks([]byte("goroutine profile: total 0\n"))
 	if err != nil || len(p.Records) != 0 {
 		t.Fatalf("empty profile: %v, %+v", err, p)
 	}
 
-	p, err = ParseStacks(strings.NewReader("goroutine profile: total 1\n1 @ 0x1 0x2\n"))
+	p, err = ParseStacks([]byte("goroutine profile: total 1\n1 @ 0x1 0x2\n"))
 	if err != nil || len(p.Records) != 1 || len(p.Records[0].Frames) != 0 {
 		t.Fatalf("frameless record: %v, %+v", err, p)
 	}
 
-	p, err = ParseStacks(strings.NewReader("goroutine profile: total 3\n1 @\n\n2 @ 0x1\n#\t0x1\tmain.f+0x1\t/x/main.go:3\n"))
+	p, err = ParseStacks([]byte("goroutine profile: total 3\n1 @\n\n2 @ 0x1\n#\t0x1\tmain.f+0x1\t/x/main.go:3\n"))
 	if err != nil || len(p.Records) != 2 || len(p.Records[0].Frames) != 0 || p.Records[1].Count != 2 {
 		t.Fatalf("record without addresses: %v, %+v", err, p)
 	}
 }
 
 func TestParseStacksRejectsGarbage(t *testing.T) {
-	if _, err := ParseStacks(strings.NewReader("<html>404 page not found</html>")); err == nil {
+	if _, err := ParseStacks([]byte("<html>404 page not found</html>")); err == nil {
 		t.Fatal("want error for a non-profile body")
 	}
 }
@@ -152,7 +150,7 @@ func TestParseFullAncestors(t *testing.T) {
 		"[originating from goroutine 1]:\nmain.start()\n\t/app/main.go:9 +0x3\ncreated by main.main in goroutine 0\n\t/app/main.go:5 +0x4\n\n" +
 		"goroutine 6 [select]:\nmain.other()\n\t/app/main.go:30 +0x5\n"
 
-	gs, err := ParseFull(strings.NewReader(body))
+	gs, err := ParseFull([]byte(body))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -167,8 +165,51 @@ func TestParseFullAncestors(t *testing.T) {
 }
 
 func TestParseFullRejectsGarbage(t *testing.T) {
-	if _, err := ParseFull(strings.NewReader("goroutine profile: total 3\n")); err == nil {
+	if _, err := ParseFull([]byte("goroutine profile: total 3\n")); err == nil {
 		t.Fatal("want error for a debug=1 body")
+	}
+}
+
+func TestParseFullRejectsEmpty(t *testing.T) {
+	for name, body := range map[string]string{
+		"empty":         "",
+		"blank lines":   "\n\n\r\n",
+		"no frames":     "goroutine 1 [running]:\n\ngoroutine 2 [select]:\n",
+		"negative id":   "goroutine -5 [select]:\nmain.f()\n\t/app/main.go:3 +0x1\n",
+		"signed id":     "goroutine +5 [select]:\nmain.f()\n\t/app/main.go:3 +0x1\n",
+		"header broken": "goroutine 5 [select\nmain.f()\n\t/app/main.go:3 +0x1\n",
+	} {
+		if gs, err := ParseFull([]byte(body)); err == nil {
+			t.Errorf("%s: want error, got %d goroutines", name, len(gs))
+		}
+	}
+}
+
+func TestParseFullHeaderDetails(t *testing.T) {
+	body := "goroutine 7 gp=0x14000102000 m=nil [chan receive (leaked), 3 minutes, locked to thread]:\nmain.f()\n\t/app/main.go:3 +0x1\n\n" +
+		"goroutine 8 [select]: {request: \"a b\"}\nmain.g()\n\t/app/main.go:4 +0x1\n"
+
+	gs, err := ParseFull([]byte(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if len(gs) != 2 || gs[0].ID != 7 || gs[0].State != "chan receive (leaked)" || gs[0].Wait != 3*time.Minute || gs[1].ID != 8 || gs[1].State != "select" {
+		t.Fatalf("goroutines %+v", gs)
+	}
+}
+
+func TestParseFullCRLF(t *testing.T) {
+	body := "goroutine 7 [select]:\r\nmain.f(0x1)\r\n\t/app/main.go:3 +0x1\r\ncreated by main.main in goroutine 1\r\n\t/app/main.go:9 +0x2\r\n\r\n"
+
+	gs, err := ParseFull([]byte(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	want := Goroutine{ID: 7, State: "select", Frames: []Frame{{"main.f", "/app/main.go", 3}}, CreatedBy: Frame{"main.main", "/app/main.go", 9}, Creator: 1}
+	if len(gs) != 1 || !reflect.DeepEqual(gs[0], want) {
+		t.Fatalf("goroutines %+v", gs)
 	}
 }
 
@@ -180,4 +221,60 @@ func TestFrameString(t *testing.T) {
 	if got := (Frame{}).String(); got != "" {
 		t.Fatalf("empty frame: got %q", got)
 	}
+}
+
+func seeds(f *testing.F) {
+	for _, name := range []string{"full.txt", "full_truncated.txt", "stacks.txt", "leak.txt"} {
+		b := open(f, name)
+		f.Add(b)
+		f.Add(bytes.ReplaceAll(b, []byte("\n"), []byte("\r\n")))
+	}
+}
+
+func FuzzParseFull(f *testing.F) {
+	seeds(f)
+
+	f.Fuzz(func(t *testing.T, b []byte) {
+		gs, err := ParseFull(b)
+		if err != nil {
+			return
+		}
+
+		if len(gs) == 0 {
+			t.Fatal("no error and no goroutines")
+		}
+
+		for _, g := range gs {
+			if g.ID < 0 || len(g.Frames) == 0 || g.Wait < 0 {
+				t.Fatalf("bad goroutine %+v", g)
+			}
+		}
+	})
+}
+
+func FuzzParseStacks(f *testing.F) {
+	seeds(f)
+
+	f.Fuzz(func(t *testing.T, b []byte) {
+		var in Strings
+
+		p, err := in.ParseStacks(b)
+		if err != nil {
+			return
+		}
+
+		sum := 0
+
+		for _, r := range p.Records {
+			if r.Count < 1 {
+				t.Fatalf("bad record %+v", r)
+			}
+
+			sum += r.Count
+		}
+
+		if sum != p.Total {
+			t.Fatalf("records hold %d goroutines, total says %d", sum, p.Total)
+		}
+	})
 }

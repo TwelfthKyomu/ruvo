@@ -3,6 +3,7 @@ package ruvo
 import (
 	"cmp"
 	"slices"
+	"strings"
 	"time"
 
 	"github.com/TwelfthKyomu/ruvo/internal/dump"
@@ -12,12 +13,30 @@ type endpoint struct {
 	id    string
 	site  string
 	entry string
+	calls string
 }
 
 func endpointOf(frames []dump.Frame) endpoint {
 	site, entry := groupKey(frames)
 
-	return endpoint{id: groupID(site, entry), site: site.String(), entry: entry.Func}
+	return endpoint{id: groupID(site, entry), site: site.String(), entry: entry.Func, calls: callList(frames)}
+}
+
+func callList(frames []dump.Frame) string {
+	var b strings.Builder
+
+	b.WriteByte(0)
+
+	for _, f := range frames {
+		b.WriteString(f.Func)
+		b.WriteByte(0)
+	}
+
+	return b.String()
+}
+
+func (e endpoint) callsFunc(fn string) bool {
+	return strings.Contains(e.calls, "\x00"+fn+"\x00")
 }
 
 type traceEdge struct {
@@ -29,9 +48,32 @@ type traceEdge struct {
 }
 
 type traceState struct {
-	at    time.Time
-	d     time.Duration
-	edges []traceEdge
+	at      time.Time
+	d       time.Duration
+	edges   []traceEdge
+	waiting []traceEdge
+	unknown int
+	raw     []byte
+	dump    []byte
+}
+
+func readWakeups(ws []Wakeup) traceState {
+	var t traceState
+
+	for _, w := range ws {
+		switch {
+		case len(w.Waiter) == 0:
+			t.unknown += w.Count
+		case w.Cause == CauseNone:
+			if to, ok := traceEndpoint(w.Waiter); ok {
+				t.waiting = append(t.waiting, traceEdge{to: to, cause: CauseNone, count: w.Count, waiters: w.Waiters, wait: w.Wait})
+			}
+		}
+	}
+
+	t.edges = traceEdges(ws)
+
+	return t
 }
 
 func traceEdges(ws []Wakeup) []traceEdge {
@@ -40,7 +82,7 @@ func traceEdges(ws []Wakeup) []traceEdge {
 
 	for _, w := range ws {
 		to, ok := traceEndpoint(w.Waiter)
-		if !ok {
+		if !ok || w.Cause == CauseNone {
 			continue
 		}
 
@@ -103,24 +145,19 @@ func traceFrames(frames []dump.Frame) []Frame {
 
 type groupIndex struct {
 	groups  map[string]*Group
-	bySite  map[string]string
+	bySite  map[string][]string
 	byEntry map[string]string
 }
 
 func newGroupIndex(groups map[string]*Group) groupIndex {
 	x := groupIndex{
 		groups:  groups,
-		bySite:  make(map[string]string, len(groups)),
+		bySite:  make(map[string][]string, len(groups)),
 		byEntry: make(map[string]string, len(groups)),
 	}
-	ambiguous := map[string]bool{}
 
 	for id, g := range groups {
-		if _, dup := x.bySite[g.WaitSite]; dup {
-			ambiguous[g.WaitSite] = true
-		}
-
-		x.bySite[g.WaitSite] = id
+		x.bySite[g.WaitSite] = append(x.bySite[g.WaitSite], id)
 
 		best, ok := x.byEntry[g.Entry]
 		if !ok || g.Count > groups[best].Count || (g.Count == groups[best].Count && id < best) {
@@ -128,71 +165,93 @@ func newGroupIndex(groups map[string]*Group) groupIndex {
 		}
 	}
 
-	for site := range ambiguous {
-		delete(x.bySite, site)
-	}
-
 	return x
 }
 
-func (x groupIndex) resolve(e endpoint) (string, bool) {
+func (x groupIndex) resolve(e endpoint) (id string, exact, ok bool) {
 	if _, ok := x.groups[e.id]; ok {
-		return e.id, true
+		return e.id, true, true
 	}
 
-	if id, ok := x.bySite[e.site]; ok {
-		return id, true
+	n := 0
+
+	for _, cand := range x.bySite[e.site] {
+		if compatible(e, x.groups[cand]) {
+			id = cand
+			n++
+		}
 	}
 
-	if isStd(e.entry) {
-		return "", false
+	switch {
+	case n == 1:
+		return id, false, true
+	case n > 1, isStd(e.entry):
+		return "", false, false
 	}
 
-	id, ok := x.byEntry[e.entry]
+	id, ok = x.byEntry[e.entry]
 
-	return id, ok
+	return id, false, ok
 }
 
-func (c *collector) edgesLocked(groups map[string]*Group) []Edge {
+func compatible(e endpoint, g *Group) bool {
+	if g.Entry == e.entry || e.callsFunc(g.Entry) {
+		return true
+	}
+
+	return slices.ContainsFunc(g.Stack, func(line string) bool {
+		fn, _, _ := strings.Cut(line, " ")
+
+		return fn == e.entry
+	})
+}
+
+func (c *collector) edgesLocked(idx groupIndex) []Edge {
 	n := len(c.trace.edges) + len(c.full.spawns)
 	if n == 0 {
 		return []Edge{}
 	}
 
-	idx := newGroupIndex(groups)
 	set := edgeSet{pos: make(map[edgeKey]int, n), out: make([]Edge, 0, n)}
 
 	for _, te := range c.trace.edges {
-		to, ok := idx.resolve(te.to)
+		to, exact, ok := idx.resolve(te.to)
 		if !ok {
 			continue
 		}
 
 		from := te.cause
 		if te.cause == CauseGoroutine {
-			if from, ok = idx.resolve(te.from); !ok {
+			var fromExact bool
+
+			if from, fromExact, ok = idx.resolve(te.from); !ok {
 				continue
 			}
+
+			exact = exact && fromExact
 		}
 
 		e := set.edge(from, to, EdgeUnblock)
 		e.Count += te.count
 		e.Waiters += te.waiters
 		e.Wait += te.wait
+		e.Approx = e.Approx || !exact
 	}
 
 	for pair, count := range c.full.spawns {
-		from, ok := idx.resolve(pair[0])
+		from, fromExact, ok := idx.resolve(pair[0])
 		if !ok {
 			continue
 		}
 
-		to, ok := idx.resolve(pair[1])
+		to, toExact, ok := idx.resolve(pair[1])
 		if !ok {
 			continue
 		}
 
-		set.edge(from, to, EdgeSpawn).Count += count
+		e := set.edge(from, to, EdgeSpawn)
+		e.Count += count
+		e.Approx = e.Approx || !fromExact || !toExact
 	}
 
 	slices.SortFunc(set.out, func(a, b Edge) int {
@@ -206,6 +265,14 @@ func (c *collector) edgesLocked(groups map[string]*Group) []Edge {
 	})
 
 	return set.out
+}
+
+func (c *collector) markUnwokenLocked(idx groupIndex) {
+	for _, te := range c.trace.waiting {
+		if id, _, ok := idx.resolve(te.to); ok {
+			idx.groups[id].Unwoken += te.count
+		}
+	}
 }
 
 type edgeSet struct {

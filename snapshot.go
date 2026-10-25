@@ -6,6 +6,9 @@ import "time"
 // the JSON API returns and what every view draws. In JSON, durations are
 // integer nanoseconds and times are RFC 3339.
 type Snapshot struct {
+	// Seq orders snapshots: a later snapshot has a larger Seq. It follows At
+	// in microseconds since the Unix epoch, but never goes back.
+	Seq        int64     `json:"seq"`
 	At         time.Time `json:"at"`
 	Target     string    `json:"target"`
 	Goroutines int       `json:"goroutines"`
@@ -25,6 +28,12 @@ type Snapshot struct {
 	TraceAt time.Time `json:"traceAt,omitzero"`
 	// TraceFor is how long that trace ran.
 	TraceFor time.Duration `json:"traceFor,omitempty"`
+	// TraceUnknown is how many wakeups of that trace had no edge because it
+	// is not known where the woken goroutines waited.
+	TraceUnknown int `json:"traceUnknown,omitempty"`
+	// Offline reports that the snapshot comes from a session file opened with
+	// OpenSession: nothing reads the target, and the actions are off.
+	Offline bool `json:"offline,omitempty"`
 	// Error is set when the last attempt to read the target failed; Groups then hold the last good data.
 	Error  string  `json:"error,omitempty"`
 	Groups []Group `json:"groups"`
@@ -48,9 +57,12 @@ type Group struct {
 	InFullDump bool `json:"inFullDump"`
 	// Growth is the trend of Count per minute over the last two minutes; a
 	// change of less than one goroutine over that span counts as zero.
-	Growth float64  `json:"growthPerMin"`
-	Leaked int      `json:"leaked"`
-	Stack  []string `json:"stack"`
+	Growth float64 `json:"growthPerMin"`
+	Leaked int     `json:"leaked"`
+	// Unwoken is how many goroutines of the group waited through the whole
+	// last trace: nothing woke them while it ran.
+	Unwoken int      `json:"unwoken,omitempty"`
+	Stack   []string `json:"stack"`
 	// Std reports that the group waits in the standard library, with no code
 	// of yours on the stack.
 	Std bool `json:"std,omitempty"`
@@ -88,4 +100,8 @@ type Edge struct {
 	// merged into the edge; it is an upper bound on the distinct goroutines.
 	// It is set only on unblock edges.
 	Waiters int `json:"waiters,omitempty"`
+	// Approx reports that an end of the edge was matched to a current group
+	// by its wait site or start function rather than exactly: the group it
+	// was recorded for is gone.
+	Approx bool `json:"approx,omitempty"`
 }

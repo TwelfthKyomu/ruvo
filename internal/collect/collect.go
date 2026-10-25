@@ -123,6 +123,10 @@ func (l *local) Name() string {
 	return "this process"
 }
 
+func (l *local) GoVersion() string {
+	return runtime.Version()
+}
+
 type capWriter struct {
 	mu    sync.Mutex
 	buf   bytes.Buffer

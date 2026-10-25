@@ -21,7 +21,9 @@ type Wakeup struct {
 	Waker []Frame
 	// Cause is CauseGoroutine, CauseNetwork or CauseTimer.
 	Cause string
-	// Waiter is the stack where the woken goroutines waited.
+	// Waiter is the stack where the woken goroutines waited. It is empty for
+	// wakeups of goroutines whose waiting stack is not known; they are only
+	// counted.
 	Waiter []Frame
 	// Count is the number of wakeups.
 	Count int
@@ -36,6 +38,10 @@ const (
 	CauseGoroutine = "goroutine"
 	CauseNetwork   = "network"
 	CauseTimer     = "timer"
+	// CauseNone marks goroutines that waited at Waiter through the whole
+	// trace: nothing woke them while it ran. Count and Waiters are the number
+	// of such goroutines and Wait is the time they waited within the trace.
+	CauseNone = "none"
 )
 
 // TraceReader reads wakeups from a runtime execution trace, as written by

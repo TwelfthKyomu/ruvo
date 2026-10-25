@@ -44,7 +44,7 @@ func BenchmarkParseFull(b *testing.B) {
 			b.SetBytes(int64(len(data)))
 
 			for b.Loop() {
-				if _, err := ParseFull(bytes.NewReader(data)); err != nil {
+				if _, err := ParseFull(data); err != nil {
 					b.Fatal(err)
 				}
 			}
@@ -60,7 +60,7 @@ func BenchmarkParseStacks(b *testing.B) {
 			b.SetBytes(int64(len(data)))
 
 			for b.Loop() {
-				if _, err := ParseStacks(bytes.NewReader(data)); err != nil {
+				if _, err := ParseStacks(data); err != nil {
 					b.Fatal(err)
 				}
 			}

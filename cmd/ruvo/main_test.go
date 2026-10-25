@@ -8,6 +8,8 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/http/pprof"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -52,15 +54,22 @@ func TestParseTarget(t *testing.T) {
 }
 
 func TestParseArgsFlagsAfterTarget(t *testing.T) {
-	target, listen, err := parseArgs([]string{"http://h:1", "-listen", "x:1"}, io.Discard)
-	if err != nil || target != "http://h:1" || listen != "x:1" {
-		t.Fatalf("target %q, listen %q, err %v", target, listen, err)
+	o, err := parseArgs([]string{"http://h:1", "-listen", "x:1"}, io.Discard)
+	if err != nil || o.target != "http://h:1" || o.listen != "x:1" || o.open != "" {
+		t.Fatalf("options %+v, err %v", o, err)
+	}
+}
+
+func TestParseArgsOpen(t *testing.T) {
+	o, err := parseArgs([]string{"-open", "s.zip", "-listen", "x:1"}, io.Discard)
+	if err != nil || o.open != "s.zip" || o.listen != "x:1" || o.target != "" {
+		t.Fatalf("options %+v, err %v", o, err)
 	}
 }
 
 func TestParseArgsUsage(t *testing.T) {
-	for _, args := range [][]string{nil, {"a", "b"}} {
-		if _, _, err := parseArgs(args, io.Discard); err != errUsage {
+	for _, args := range [][]string{nil, {"a", "b"}, {"-open", "s.zip", "http://h:1"}, {"http://h:1", "-open", "s.zip"}} {
+		if _, err := parseArgs(args, io.Discard); err != errUsage {
 			t.Errorf("parseArgs(%q): err %v, want errUsage", args, err)
 		}
 	}
@@ -233,4 +242,68 @@ func TestCLIRecordsTrace(t *testing.T) {
 	}
 
 	t.Fatalf("no unblock edge from the producer to the workers: %+v", s.Edges)
+}
+
+func TestOpenSavedSession(t *testing.T) {
+	live := httptest.NewServer(newHandler(pprofServer(t).URL))
+	defer live.Close()
+
+	resp, err := client.Get(live.URL + "/api/export")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	data, err := io.ReadAll(resp.Body)
+	resp.Body.Close()
+
+	if err != nil || resp.StatusCode != http.StatusOK {
+		t.Fatalf("export: status %d, err %v", resp.StatusCode, err)
+	}
+
+	path := filepath.Join(t.TempDir(), "session.zip")
+	if err := os.WriteFile(path, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	h, err := openHandler(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	srv := httptest.NewServer(h)
+	defer srv.Close()
+
+	for _, page := range []string{"/", "/flow/"} {
+		resp, err := client.Get(srv.URL + page)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		resp.Body.Close()
+
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("GET %s: status %d", page, resp.StatusCode)
+		}
+	}
+
+	resp, err = client.Get(srv.URL + "/flow/api/snapshot")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	defer resp.Body.Close()
+
+	var s ruvo.Snapshot
+
+	if err := json.NewDecoder(resp.Body).Decode(&s); err != nil {
+		t.Fatal(err)
+	}
+
+	if !s.Offline || s.Goroutines == 0 || len(s.Groups) == 0 {
+		t.Fatalf("offline %v, %d goroutines, %d groups", s.Offline, s.Goroutines, len(s.Groups))
+	}
+
+	if _, err := openHandler(filepath.Join(t.TempDir(), "missing.zip")); err == nil {
+		t.Fatal("want an error for a missing file")
+	}
 }

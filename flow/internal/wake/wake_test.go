@@ -58,16 +58,45 @@ func user(fs []ruvo.Frame) bool {
 	return false
 }
 
+func kindOf(w ruvo.Wakeup) int {
+	switch {
+	case len(w.Waiter) == 0:
+		return 2
+	case w.Cause == ruvo.CauseNone:
+		return 1
+	}
+
+	return 0
+}
+
 func check(t *testing.T, ws []ruvo.Wakeup) {
 	t.Helper()
 
 	for i, w := range ws {
+		kind := kindOf(w)
+
+		if i > 0 && kindOf(ws[i-1]) > kind {
+			t.Fatalf("edges, then goroutines still waiting, then unknown wakeups: %s after %s", show(w), show(ws[i-1]))
+		}
+
+		if kind == 2 {
+			if len(w.Waker) != 0 || w.Count < 1 || w.Waiters != 0 || w.Wait != 0 || w.Cause == ruvo.CauseNone {
+				t.Fatalf("bad count of unknown wakeups: %s", show(w))
+			}
+
+			if i > 0 && kindOf(ws[i-1]) == 2 && ws[i-1].Cause >= w.Cause {
+				t.Fatalf("unknown wakeups not one per cause in order: %s after %s", show(w), show(ws[i-1]))
+			}
+
+			continue
+		}
+
 		switch w.Cause {
 		case ruvo.CauseGoroutine:
 			if !user(w.Waker) {
 				t.Fatalf("goroutine wakeup without a user waker stack: %s", show(w))
 			}
-		case ruvo.CauseNetwork, ruvo.CauseTimer:
+		case ruvo.CauseNetwork, ruvo.CauseTimer, ruvo.CauseNone:
 			if len(w.Waker) != 0 {
 				t.Fatalf("%s wakeup with a waker stack: %s", w.Cause, show(w))
 			}
@@ -83,7 +112,11 @@ func check(t *testing.T, ws []ruvo.Wakeup) {
 			t.Fatalf("bad totals: %s", show(w))
 		}
 
-		if i > 0 {
+		if kind == 1 && w.Waiters != w.Count {
+			t.Fatalf("each goroutine still waiting counts once: %s", show(w))
+		}
+
+		if i > 0 && kindOf(ws[i-1]) == kind {
 			p := ws[i-1]
 
 			if p.Wait < w.Wait || p.Wait == w.Wait && p.Count < w.Count {
@@ -91,6 +124,18 @@ func check(t *testing.T, ws []ruvo.Wakeup) {
 			}
 		}
 	}
+}
+
+func unknown(ws []ruvo.Wakeup) int {
+	n := 0
+
+	for _, w := range ws {
+		if len(w.Waiter) == 0 {
+			n += w.Count
+		}
+	}
+
+	return n
 }
 
 func has(fs []ruvo.Frame, s string) bool {
@@ -400,12 +445,42 @@ func TestWaitersBlockedBeforeStartUseStacks(t *testing.T) {
 	parked := []ruvo.Frame{{Func: "x.parked", File: "/home/dev/p.go", Line: 1}}
 	stacks := map[int64][]ruvo.Frame{}
 
-	for _, id := range waiting("wake.worker", "github.com/TwelfthKyomu/ruvo/flow/internal/wake.TestWaitersBlockedBeforeStartUseStacks") {
-		stacks[id] = parked
-	}
+	data := capture(t, func() {
+		for _, id := range waiting("wake.worker", "github.com/TwelfthKyomu/ruvo/flow/internal/wake.TestWaitersBlockedBeforeStartUseStacks") {
+			stacks[id] = parked
+		}
+
+		for i := range 4 {
+			jobs <- i
+		}
+	})
+	close(jobs)
 
 	if len(stacks) != 4 {
 		t.Fatalf("found %d waiting workers in the dump, want 4", len(stacks))
+	}
+
+	ws, _ := parse(t, data, stacks)
+
+	w, ok := find(ws, ruvo.CauseGoroutine, "", "x.parked")
+	if !ok || w.Waiters != 4 || len(w.Waiter) != 1 {
+		t.Fatalf("wakeup of workers blocked before the trace: %s (found %v)%s", show(w), ok, top(ws))
+	}
+}
+
+func TestDumpBeforeTraceIsNotUsed(t *testing.T) {
+	jobs := make(chan int)
+
+	for range 4 {
+		go worker(jobs, 0)
+	}
+
+	time.Sleep(10 * time.Millisecond)
+
+	stacks := map[int64][]ruvo.Frame{}
+
+	for _, id := range waiting("wake.worker", "github.com/TwelfthKyomu/ruvo/flow/internal/wake.TestDumpBeforeTraceIsNotUsed") {
+		stacks[id] = []ruvo.Frame{{Func: "x.parked", File: "/home/dev/p.go", Line: 1}}
 	}
 
 	data := capture(t, func() {
@@ -417,9 +492,103 @@ func TestWaitersBlockedBeforeStartUseStacks(t *testing.T) {
 
 	ws, _ := parse(t, data, stacks)
 
-	w, ok := find(ws, ruvo.CauseGoroutine, "", "x.parked")
-	if !ok || w.Waiters != 4 || len(w.Waiter) != 1 {
-		t.Fatalf("wakeup of workers blocked before the trace: %s (found %v)%s", show(w), ok, top(ws))
+	if w, ok := find(ws, ruvo.CauseGoroutine, "", "x.parked"); ok || unknown(ws) < 4 {
+		t.Fatalf("a dump taken before the trace was used: %s (found %v), %d unknown%s", show(w), ok, unknown(ws), top(ws))
+	}
+}
+
+func waitOnA(a <-chan struct{}) {
+	<-a
+}
+
+func waitOnB(b <-chan struct{}) {
+	<-b
+}
+
+func twoWaits(a, b <-chan struct{}) {
+	waitOnA(a)
+	waitOnB(b)
+}
+
+func TestLaterDumpDoesNotRewriteEarlierWait(t *testing.T) {
+	a, b := make(chan struct{}), make(chan struct{})
+	defer close(b)
+
+	go twoWaits(a, b)
+	time.Sleep(10 * time.Millisecond)
+
+	stacks := map[int64][]ruvo.Frame{}
+
+	data := capture(t, func() {
+		time.Sleep(25 * time.Millisecond)
+		close(a)
+		time.Sleep(175 * time.Millisecond)
+
+		for _, id := range waiting("wake.waitOnB", "github.com/TwelfthKyomu/ruvo/flow/internal/wake.TestLaterDumpDoesNotRewriteEarlierWait") {
+			stacks[id] = []ruvo.Frame{{Func: "x.atB", File: "/home/dev/p.go", Line: 2}}
+		}
+
+		time.Sleep(20 * time.Millisecond)
+	})
+
+	if len(stacks) != 1 {
+		t.Fatalf("found %d goroutines waiting on B in the dump, want 1", len(stacks))
+	}
+
+	ws, _ := parse(t, data, stacks)
+
+	if w, ok := total(ws, ruvo.CauseGoroutine, "", "x.atB"); ok {
+		t.Fatalf("the wakeup from A was put on B, where the goroutine waited only later: %s%s", show(w), top(ws))
+	}
+
+	if unknown(ws) < 1 {
+		t.Fatalf("the wakeup from A is not counted as unknown%s", top(ws))
+	}
+
+	if w, ok := find(ws, ruvo.CauseNone, "", "wake.waitOnB"); ok {
+		t.Fatalf("the goroutine was woken from A, so it did not sleep through the trace: %s%s", show(w), top(ws))
+	}
+}
+
+func TestUnwokenWaitersAreReported(t *testing.T) {
+	stop := make(chan struct{})
+	defer close(stop)
+
+	for range 12 {
+		go waitOnB(stop)
+	}
+
+	time.Sleep(10 * time.Millisecond)
+
+	data := capture(t, func() { time.Sleep(220 * time.Millisecond) })
+	ws, _ := parse(t, data, nil)
+
+	w, ok := find(ws, ruvo.CauseNone, "", "wake.waitOnB")
+	if !ok || w.Count != 12 || w.Waiters != 12 || w.Wait < 12*200*time.Millisecond {
+		t.Fatalf("goroutines that waited the whole trace: %s (found %v)%s", show(w), ok, top(ws))
+	}
+
+	if _, ok := find(ws, ruvo.CauseGoroutine, "", "wake.waitOnB"); ok {
+		t.Fatalf("nothing woke them, yet there is an edge%s", top(ws))
+	}
+}
+
+func TestBusyWaitersAreNotUnwoken(t *testing.T) {
+	jobs := make(chan int)
+
+	for range 4 {
+		go worker(jobs, 0)
+	}
+
+	time.Sleep(10 * time.Millisecond)
+
+	data := capture(t, func() { produceFor(jobs, time.Millisecond, 300*time.Millisecond) })
+	close(jobs)
+
+	ws, _ := parse(t, data, nil)
+
+	if w, ok := find(ws, ruvo.CauseNone, "", "wake.worker"); ok {
+		t.Fatalf("workers woken all along are waiting at the end, but they did not sleep through the trace: %s%s", show(w), top(ws))
 	}
 }
 

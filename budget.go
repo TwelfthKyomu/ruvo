@@ -9,7 +9,7 @@ const (
 	fullMin        = time.Minute
 	fullMax        = 30 * time.Minute
 	fullFactor     = 1000
-	historyWindow  = 10 * time.Minute
+	historyWindow  = growthSpan
 	idleStop       = 10 * time.Minute
 	fetchTimeout   = 30 * time.Second
 	growthSpan     = 2 * time.Minute

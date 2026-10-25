@@ -585,6 +585,118 @@ func TestEventsSurviveWriteTimeout(t *testing.T) {
 	}
 }
 
+func readEvents(body io.Reader) <-chan struct{} {
+	events := make(chan struct{}, 64)
+
+	go func() {
+		sc := bufio.NewScanner(body)
+		sc.Buffer(make([]byte, 64*1024), 8<<20)
+
+		for sc.Scan() {
+			if strings.HasPrefix(sc.Text(), "data: ") {
+				events <- struct{}{}
+			}
+		}
+
+		close(events)
+	}()
+
+	return events
+}
+
+func TestEventsSurviveIdleHTTP2(t *testing.T) {
+	src := newFake(t, "stacks.txt", "full.txt", "")
+
+	h := NewHandler(Source{src: src}).(*handler)
+	h.writeTimeout = 100 * time.Millisecond
+	t.Cleanup(h.c.close)
+
+	srv := httptest.NewUnstartedServer(h)
+	srv.EnableHTTP2 = true
+	srv.StartTLS()
+	defer srv.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, srv.URL+"/api/events", nil)
+
+	resp, err := srv.Client().Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	defer resp.Body.Close()
+
+	if resp.ProtoMajor != 2 {
+		t.Fatalf("protocol %s, want HTTP/2", resp.Proto)
+	}
+
+	events := readEvents(resp.Body)
+	<-events
+
+	time.Sleep(400 * time.Millisecond)
+
+	src.set(func(f *fakeSource) { f.debug1 = stacksText(3) })
+	h.c.sample(context.Background(), false)
+
+	select {
+	case _, ok := <-events:
+		if !ok {
+			t.Fatal("the idle HTTP/2 stream was closed")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("no event after an idle spell")
+	}
+}
+
+func manyGroups(n int) []byte {
+	var b strings.Builder
+
+	fmt.Fprintf(&b, "goroutine profile: total %d\n", n)
+
+	for i := range n {
+		fmt.Fprintf(&b, "1 @ 0x1\n#\t0x1\tmain.wait%d+0x1\t/home/dev/a.go:%d\n#\t0x1\tmain.entry%d+0x1\t/home/dev/b.go:%d\n\n", i, i+1, i, i+1)
+	}
+
+	return []byte(b.String())
+}
+
+func TestStuckReaderIsDropped(t *testing.T) {
+	src := &fakeSource{debug1: manyGroups(5000)}
+
+	h := NewHandler(Source{src: src}).(*handler)
+	h.writeTimeout = 200 * time.Millisecond
+	t.Cleanup(h.c.close)
+
+	srv := httptest.NewServer(h)
+	defer srv.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, srv.URL+"/api/events", nil)
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	defer resp.Body.Close()
+
+	waitFor(t, 2*time.Second, func() bool { return h.c.subscribers() == 1 })
+
+	for i := 0; h.c.subscribers() > 0; i++ {
+		if i == 200 {
+			t.Fatal("a reader that never reads is still subscribed")
+		}
+
+		src.set(func(f *fakeSource) { f.debug1 = manyGroups(5000 + i%2) })
+		h.c.sample(context.Background(), false)
+		time.Sleep(20 * time.Millisecond)
+	}
+}
+
 func TestZeroSourceIsLocal(t *testing.T) {
 	h := NewHandler(Source{}).(*handler)
 	t.Cleanup(h.c.close)

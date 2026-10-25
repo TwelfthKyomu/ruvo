@@ -15,10 +15,10 @@ import (
 
 // View is an extra page that draws snapshots its own way. Its handler is
 // mounted at /<Name>/ next to the built-in list; api serves the JSON API
-// (api/snapshot, api/events, api/leaks, api/full, api/trace) relative to the
-// view. A view that also implements TraceReader turns on api/trace, which
-// records an execution trace of the target and adds unblock edges to the
-// snapshot; if several views do, the first one reads the traces.
+// (api/snapshot, api/events, api/leaks, api/full, api/trace, api/export)
+// relative to the view. A view that also implements TraceReader turns on
+// api/trace, which records an execution trace of the target and adds unblock
+// edges to the snapshot; if several views do, the first one reads the traces.
 type View interface {
 	Name() string
 	Handler(api http.Handler) http.Handler
@@ -58,7 +58,16 @@ func NewHandler(src Source, views ...View) http.Handler {
 		src = Local()
 	}
 
-	h := &handler{c: newCollector(src.src), views: map[string]http.Handler{}, cop: http.NewCrossOriginProtection()}
+	return newHandler(newCollector(src.src), views)
+}
+
+func newHandler(c *collector, views []View) *handler {
+	h := &handler{
+		c:            c,
+		views:        map[string]http.Handler{},
+		cop:          http.NewCrossOriginProtection(),
+		writeTimeout: eventWriteTimeout,
+	}
 	api := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { h.serveAPI(w, r, r.URL.Path) })
 
 	for _, v := range views {

@@ -139,6 +139,26 @@
             display: block;
         }
 
+        a.button {
+            font: inherit;
+            padding: 4px 10px;
+            border: 1px solid var(--line);
+            border-radius: 6px;
+            background: var(--panel);
+            color: var(--accent);
+            text-decoration: none;
+        }
+
+        a.button:hover {
+            background: var(--hover);
+        }
+
+        .banner.info {
+            background: var(--panel);
+            color: var(--text);
+            border: 1px solid var(--line);
+        }
+
         main {
             padding: 16px 20px 40px;
         }
@@ -265,6 +285,7 @@
         <span class="stat dim" id="updated">connecting…</span>
         <span class="stat"><span id="full">full dump: never</span> <button id="fullBtn" type="button">Full dump</button></span>
         <span class="stat"><span id="leaks">leaks: never</span> <button id="leaksBtn" type="button">Find leaks</button></span>
+        <span class="stat"><a class="button" id="export" href="api/export" download title="Save what this page shows, with the dumps and the trace behind it, as a zip file; open it again with ruvo -open">Export</a></span>
         <span class="note" id="note"></span>
     </div>
 </header>
@@ -313,7 +334,7 @@
 
     function since(at) {
         if (!at || !snap) return null;
-        return Date.parse(snap.at) - Date.parse(at) + (Date.now() - received);
+        return Date.parse(snap.at) - Date.parse(at) + (snap.offline ? 0 : Date.now() - received);
     }
 
     function count(v) {
@@ -343,6 +364,7 @@
     function banner() {
         if (lost) return "Lost connection to ruvo — retrying…";
         if (!snap) return "";
+        if (snap.offline) return "Opened from a file: this is what ruvo saw at " + new Date(snap.at).toLocaleString() + ". Nothing reads the target, so the actions are off.";
         if (snap.error) return "Cannot read the target: " + snap.error;
         const quiet = Date.now() - fresh;
         if (quiet > Math.max(3 * snap.interval / 1e6, 15000)) return "No new data for " + ago(quiet).replace(" ago", "") + ".";
@@ -354,10 +376,12 @@
         const b = $("banner");
         b.textContent = text;
         b.classList.toggle("on", text !== "");
+        b.classList.toggle("info", !lost && !!(snap && snap.offline));
         if (!snap) return;
         $("target").textContent = snap.target;
         $("count").textContent = count(snap.goroutines);
-        $("updated").textContent = "updated " + ago(Date.now() - fresh);
+        $("updated").textContent = snap.offline ? "taken " + new Date(snap.at).toLocaleString() : "updated " + ago(Date.now() - fresh);
+        if (snap.offline) $("fullBtn").disabled = $("leaksBtn").disabled = true;
         const f = since(snap.fullAt);
         const cut = snap.fullCut === true;
         $("full").textContent = "full dump: " + (f === null ? "never" : ago(f)) + (cut ? " · " + count(snap.fullCount) + " of " + count(snap.goroutines) : "");
@@ -425,8 +449,8 @@
     }
 
     function show(s) {
-        if (snap && Date.parse(s.at) < Date.parse(snap.at)) return;
-        if (!snap || s.at !== snap.at) fresh = Date.now();
+        if (snap && s.seq < snap.seq) return;
+        if (!snap || s.seq !== snap.seq) fresh = Date.now();
         snap = s;
         received = Date.now();
         lost = false;

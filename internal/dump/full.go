@@ -1,10 +1,10 @@
 package dump
 
 import (
+	"bytes"
+	"errors"
 	"fmt"
-	"io"
 	"strconv"
-	"strings"
 	"time"
 )
 
@@ -17,20 +17,26 @@ type Goroutine struct {
 	Creator   int64
 }
 
-func ParseFull(r io.Reader) ([]Goroutine, error) {
-	sc := newScanner(r)
-	p := fullParser{}
+func ParseFull(data []byte) ([]Goroutine, error) {
+	ls := lines{data: data}
+	p := fullParser{
+		in:     Strings{},
+		stacks: map[string][]Frame{},
+	}
 	started := false
 
-	for sc.Scan() {
-		line := sc.Text()
+	for {
+		line, ok := ls.next()
+		if !ok {
+			break
+		}
 
 		if !started {
-			if line == "" {
+			if len(line) == 0 {
 				continue
 			}
 
-			if !isHeader(line) {
+			if _, _, ok := splitHeader(line); !ok {
 				return nil, fmt.Errorf("dump: not a debug=2 dump: %s", quote(line))
 			}
 
@@ -40,85 +46,129 @@ func ParseFull(r io.Reader) ([]Goroutine, error) {
 		p.line(line)
 	}
 
-	if err := sc.Err(); err != nil {
-		return nil, err
-	}
-
 	p.finish()
 
-	return p.out, nil
+	switch {
+	case !started:
+		return nil, errors.New("dump: empty debug=2 dump")
+	case p.n == 0:
+		return nil, errors.New("dump: no goroutines in debug=2 dump")
+	}
+
+	out := make([]Goroutine, 0, p.n)
+
+	for _, c := range p.chunks {
+		out = append(out, c...)
+	}
+
+	return out, nil
 }
 
+const chunkSize = 1024
+
 type fullParser struct {
-	out     []Goroutine
-	cur     *Goroutine
-	pending string
+	chunks  [][]Goroutine
+	n       int
+	in      Strings
+	stacks  map[string][]Frame
+	key     []byte
+	frames  []Frame
+	cur     Goroutine
+	active  bool
+	pending []byte
+	waiting bool
 	created bool
 	broken  bool
 	origin  bool
 }
 
-func (p *fullParser) line(line string) {
+func (p *fullParser) line(line []byte) {
+	if len(line) == 0 {
+		p.finish()
+		return
+	}
+
+	if id, rest, ok := splitHeader(line); ok {
+		p.finish()
+		p.header(id, rest)
+
+		return
+	}
+
 	switch {
-	case line == "":
-		p.finish()
-	case isHeader(line):
-		p.finish()
-		p.header(line)
-	case p.cur == nil:
-	case p.origin || strings.HasPrefix(line, "[originating from goroutine"):
+	case !p.active:
+	case p.origin || bytes.HasPrefix(line, []byte("[originating from goroutine")):
 		p.origin = true
-	case strings.HasPrefix(line, "\t"):
+	case line[0] == '\t':
 		p.fileLine(line)
-	case strings.HasPrefix(line, "created by "):
+	case bytes.HasPrefix(line, []byte("created by ")):
 		p.createdBy(line)
-	case strings.HasPrefix(line, "..."):
+	case bytes.HasPrefix(line, []byte("...")):
 	default:
-		if p.pending != "" {
+		if p.waiting {
 			p.broken = true
 		}
 
 		p.pending = funcName(line)
+		p.waiting = true
 	}
 }
 
-func (p *fullParser) header(line string) {
-	rest := strings.TrimPrefix(line, "goroutine ")
+func splitHeader(line []byte) (id int64, rest []byte, ok bool) {
+	rest, ok = bytes.CutPrefix(line, []byte("goroutine "))
+	if !ok {
+		return 0, nil, false
+	}
 
-	id, rest, ok := strings.Cut(rest, " [")
+	i := 0
+	for i < len(rest) && rest[i] >= '0' && rest[i] <= '9' {
+		i++
+	}
+
+	if i == 0 || i > 18 || i == len(rest) || rest[i] != ' ' {
+		return 0, nil, false
+	}
+
+	n, _ := atoi(rest[:i])
+	rest = rest[i:]
+
+	if !bytes.HasPrefix(rest, []byte(" [")) && !bytes.HasPrefix(rest, []byte(" gp=")) {
+		return 0, nil, false
+	}
+
+	j := bytes.Index(rest, []byte(" ["))
+	if j < 0 {
+		return 0, nil, false
+	}
+
+	return int64(n), rest[j+2:], true
+}
+
+func (p *fullParser) header(id int64, rest []byte) {
+	inside, _, ok := bytes.Cut(rest, []byte("]"))
 	if !ok {
 		return
 	}
 
-	n, err := strconv.ParseInt(id, 10, 64)
-	if err != nil {
-		return
-	}
+	state, extra, _ := bytes.Cut(inside, []byte(", "))
+	p.cur = Goroutine{ID: id, State: p.in.str(state)}
 
-	inside, _, ok := strings.Cut(rest, "]")
-	if !ok {
-		return
-	}
+	for len(extra) > 0 {
+		var part []byte
 
-	parts := strings.Split(inside, ", ")
-	g := Goroutine{ID: n, State: parts[0]}
+		part, extra, _ = bytes.Cut(extra, []byte(", "))
 
-	for _, part := range parts[1:] {
-		if m, ok := strings.CutSuffix(part, " minutes"); ok {
-			if v, err := strconv.Atoi(m); err == nil {
-				g.Wait = time.Duration(v) * time.Minute
+		if m, ok := bytes.CutSuffix(part, []byte(" minutes")); ok {
+			if v, ok := atoi(m); ok {
+				p.cur.Wait = time.Duration(v) * time.Minute
 			}
 		}
 	}
 
-	p.cur = &g
-	p.pending = ""
-	p.created = false
-	p.broken = false
-	p.origin = false
+	p.active = true
 }
 
-func (p *fullParser) fileLine(line string) {
+func (p *fullParser) fileLine(line []byte) {
 	file, n, ok := parseFileLine(line)
 	if !ok {
 		p.broken = true
@@ -127,62 +177,80 @@ func (p *fullParser) fileLine(line string) {
 
 	switch {
 	case p.created:
-		p.cur.CreatedBy.File = file
+		p.cur.CreatedBy.File = p.in.str(file)
 		p.cur.CreatedBy.Line = n
 		p.created = false
-	case p.pending != "":
-		p.cur.Frames = append(p.cur.Frames, Frame{Func: p.pending, File: file, Line: n})
-		p.pending = ""
+	case p.waiting:
+		p.frames = append(p.frames, Frame{Func: p.in.str(p.pending), File: p.in.str(file), Line: n})
+		p.waiting = false
 	}
 }
 
-func (p *fullParser) createdBy(line string) {
-	rest := strings.TrimPrefix(line, "created by ")
-	fn, id, _ := strings.Cut(rest, " in goroutine ")
+func (p *fullParser) createdBy(line []byte) {
+	rest := line[len("created by "):]
+	fn, id, _ := bytes.Cut(rest, []byte(" in goroutine "))
 
-	p.cur.CreatedBy = Frame{Func: fn}
+	p.cur.CreatedBy = Frame{Func: p.in.str(fn)}
 
-	if n, err := strconv.ParseInt(strings.TrimSpace(id), 10, 64); err == nil {
-		p.cur.Creator = n
+	if n, ok := atoi(bytes.TrimSpace(id)); ok {
+		p.cur.Creator = int64(n)
 	}
 
 	p.created = true
 }
 
 func (p *fullParser) finish() {
-	if p.cur != nil && !p.broken && p.pending == "" && len(p.cur.Frames) > 0 {
-		p.out = append(p.out, *p.cur)
+	if p.active && !p.broken && !p.waiting && len(p.frames) > 0 {
+		p.cur.Frames = p.intern(p.frames)
+		p.add(p.cur)
 	}
 
-	p.cur = nil
-	p.pending = ""
+	p.frames = p.frames[:0]
+	p.active = false
+	p.waiting = false
 	p.created = false
 	p.broken = false
 	p.origin = false
 }
 
-func isHeader(line string) bool {
-	rest, ok := strings.CutPrefix(line, "goroutine ")
-	if !ok {
-		return false
+func (p *fullParser) add(g Goroutine) {
+	last := len(p.chunks) - 1
+	if last < 0 || len(p.chunks[last]) == chunkSize {
+		p.chunks = append(p.chunks, make([]Goroutine, 0, chunkSize))
+		last++
 	}
 
-	id, _, ok := strings.Cut(rest, " [")
-	if !ok || id == "" {
-		return false
-	}
-
-	_, err := strconv.ParseInt(id, 10, 64)
-
-	return err == nil
+	p.chunks[last] = append(p.chunks[last], g)
+	p.n++
 }
 
-func funcName(line string) string {
-	if !strings.HasSuffix(line, ")") {
+func (p *fullParser) intern(frames []Frame) []Frame {
+	p.key = p.key[:0]
+
+	for _, f := range frames {
+		p.key = append(p.key, f.Func...)
+		p.key = append(p.key, 0)
+		p.key = append(p.key, f.File...)
+		p.key = strconv.AppendInt(append(p.key, 0), int64(f.Line), 10)
+		p.key = append(p.key, '\n')
+	}
+
+	if s, ok := p.stacks[string(p.key)]; ok {
+		return s
+	}
+
+	s := append([]Frame(nil), frames...)
+	p.stacks[string(p.key)] = s
+
+	return s
+}
+
+func funcName(line []byte) []byte {
+	if !bytes.HasSuffix(line, []byte(")")) {
 		return line
 	}
 
-	if i := strings.LastIndexByte(line, '('); i > 0 {
+	if i := bytes.LastIndexByte(line, '('); i > 0 {
 		return line[:i]
 	}
 

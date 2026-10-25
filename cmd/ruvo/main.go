@@ -4,7 +4,10 @@
 //	ruvo http://localhost:6060
 //
 // It serves the goroutine list at / and the flow view, which draws who wakes
-// whom, at /flow/.
+// whom, at /flow/. The Export link on those pages saves a session file; open
+// it again, without the service, with:
+//
+//	ruvo -open ruvo-localhost-6060-20261026-150405.zip
 package main
 
 import (
@@ -26,7 +29,7 @@ import (
 	"github.com/TwelfthKyomu/ruvo/flow"
 )
 
-const usage = "usage: ruvo [-listen addr] http://host:port"
+const usage = "usage: ruvo [-listen addr] http://host:port\n       ruvo [-listen addr] -open session.zip"
 
 var errUsage = errors.New(usage)
 
@@ -34,8 +37,14 @@ func main() {
 	os.Exit(run(os.Args[1:], os.Stdout, os.Stderr))
 }
 
+type options struct {
+	target string
+	listen string
+	open   string
+}
+
 func run(args []string, stdout, stderr io.Writer) int {
-	raw, listen, err := parseArgs(args, stderr)
+	o, err := parseArgs(args, stderr)
 
 	switch {
 	case errors.Is(err, flag.ErrHelp):
@@ -47,27 +56,22 @@ func run(args []string, stdout, stderr io.Writer) int {
 		return 2
 	}
 
-	target, err := parseTarget(raw)
-	if err != nil {
-		fmt.Fprintln(stderr, "ruvo:", err)
-		return 1
-	}
-
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	if err := check(ctx, target); err != nil {
-		fmt.Fprintln(stderr, "ruvo:", err)
-		return 1
-	}
-
-	ln, err := net.Listen("tcp", listen)
+	h, what, err := serving(ctx, o)
 	if err != nil {
 		fmt.Fprintln(stderr, "ruvo:", err)
 		return 1
 	}
 
-	srv := &http.Server{Handler: newHandler(target), ReadHeaderTimeout: 10 * time.Second}
+	ln, err := net.Listen("tcp", o.listen)
+	if err != nil {
+		fmt.Fprintln(stderr, "ruvo:", err)
+		return 1
+	}
+
+	srv := &http.Server{Handler: h, ReadHeaderTimeout: 10 * time.Second}
 
 	go func() {
 		<-ctx.Done()
@@ -78,7 +82,7 @@ func run(args []string, stdout, stderr io.Writer) int {
 		srv.Shutdown(shutdown)
 	}()
 
-	fmt.Fprintf(stdout, "ruvo: watching %s\nruvo: open http://%s/flow/\n", redact(target), shown(listen, ln.Addr()))
+	fmt.Fprintf(stdout, "ruvo: %s\nruvo: open http://%s/flow/\n", what, shown(o.listen, ln.Addr()))
 
 	if err := srv.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		fmt.Fprintln(stderr, "ruvo:", err)
@@ -88,14 +92,55 @@ func run(args []string, stdout, stderr io.Writer) int {
 	return 0
 }
 
+func serving(ctx context.Context, o options) (http.Handler, string, error) {
+	if o.open != "" {
+		h, err := openHandler(o.open)
+
+		return h, "showing " + o.open, err
+	}
+
+	target, err := parseTarget(o.target)
+	if err != nil {
+		return nil, "", err
+	}
+
+	if err := check(ctx, target); err != nil {
+		return nil, "", err
+	}
+
+	return newHandler(target), "watching " + redact(target), nil
+}
+
 func newHandler(target string) http.Handler {
 	return ruvo.NewHandler(ruvo.Remote(target), flow.View())
 }
 
-func parseArgs(args []string, stderr io.Writer) (string, string, error) {
+func openHandler(path string) (http.Handler, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+
+	defer f.Close()
+
+	st, err := f.Stat()
+	if err != nil {
+		return nil, err
+	}
+
+	h, err := ruvo.OpenSession(f, st.Size(), flow.View())
+	if err != nil {
+		return nil, fmt.Errorf("%s: %w", path, err)
+	}
+
+	return h, nil
+}
+
+func parseArgs(args []string, stderr io.Writer) (options, error) {
 	flags := flag.NewFlagSet("ruvo", flag.ContinueOnError)
 	flags.SetOutput(stderr)
 	listen := flags.String("listen", "localhost:7070", "address to serve the ruvo page on")
+	open := flags.String("open", "", "show a session saved with Export instead of watching a service")
 
 	flags.Usage = func() {
 		fmt.Fprintln(stderr, usage)
@@ -103,23 +148,28 @@ func parseArgs(args []string, stderr io.Writer) (string, string, error) {
 	}
 
 	if err := flags.Parse(args); err != nil {
-		return "", "", err
+		return options{}, err
 	}
 
-	rest := flags.Args()
-	if len(rest) == 0 {
-		return "", "", errUsage
+	var target string
+
+	if rest := flags.Args(); len(rest) > 0 {
+		target = rest[0]
+
+		if err := flags.Parse(rest[1:]); err != nil {
+			return options{}, err
+		}
+
+		if flags.NArg() != 0 {
+			return options{}, errUsage
+		}
 	}
 
-	if err := flags.Parse(rest[1:]); err != nil {
-		return "", "", err
+	if (target == "") == (*open == "") {
+		return options{}, errUsage
 	}
 
-	if flags.NArg() != 0 {
-		return "", "", errUsage
-	}
-
-	return rest[0], *listen, nil
+	return options{target: target, listen: *listen, open: *open}, nil
 }
 
 func parseTarget(s string) (string, error) {

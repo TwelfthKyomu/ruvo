@@ -58,6 +58,32 @@ The list is at `/debug/ruvo/` and the flow page at `/debug/ruvo/flow/`
 Mount it only on a listener you control, like `net/http/pprof`: the page shows
 every goroutine stack and can trigger full dumps and traces.
 
+## Save it and show a colleague
+
+**Export** on either page saves a zip file: what the page shows, plus the raw
+data behind it, so the diagnosis can be checked without the service.
+
+| File | What it is |
+|---|---|
+| `snapshot.json` | the snapshot the page showed |
+| `goroutines.txt` | the last goroutine profile, `debug=1` |
+| `goroutines-full.txt` | the last full dump, `debug=2` |
+| `goroutineleak.txt` | the last `goroutineleak` profile |
+| `trace.out` | the last execution trace — `go tool trace trace.out` opens it |
+| `trace-goroutines-full.txt` | the full dump taken while that trace ran, if it is not the last full dump |
+| `session.json`, `README.txt` | when each file was read, the target, the versions of ruvo and Go |
+
+Only files ruvo has are included. Open the session again, without the
+service:
+
+```bash
+ruvo -open ruvo-localhost-6060-20261026-150405.zip
+```
+
+The pages show the saved snapshot as it was, with a note that it comes from a
+file; Full dump, Find leaks and Record trace are off. In your own code,
+`ruvo.OpenSession` serves a session file the same way.
+
 ## Who wakes whom
 
 The flow page draws the same groups as the list, plus the handoffs between
@@ -83,6 +109,13 @@ them. Press **Record trace**: ruvo records an execution trace of the target for
 - **`network`, `timer`** — a badge on a node shows what share of its waiting
   ended with a wakeup from the network or a timer instead of a goroutine
   (shown from 20%). They are not nodes: no goroutine is to blame.
+- **`not woken N`** — N goroutines of the group waited through the whole
+  recording: nothing woke them, so no arrow leads to them. A deadlock or a leak
+  looks like this, and so does an idle pool.
+- **Dotted arrow** — the group an end of the arrow was recorded for is gone,
+  and ruvo matched it to a current group by its wait site (only when the two
+  stacks share the start function) or by its start function alone. A match that
+  fits more than one group is dropped rather than guessed.
 - **spawn** — a checkbox. When on, dashed arrows show which group started
   which, from `created by` in the last full dump. Off by default.
 
@@ -96,7 +129,11 @@ CPU-bound target loses up to about 4% of its throughput (measured on a service
 doing ~40,000 requests per second on one core; a service that mostly waits
 loses nothing measurable). During the recording ruvo takes one full dump to
 learn where goroutines that fell asleep before it were waiting; it skips that
-dump if a full dump was attempted in the previous 10 s. A 5 s trace is about
+dump if a full dump was attempted in the previous 10 s. The trace itself shows
+when the dump stopped the world, and its stacks are used only for wakeups after
+that moment: a goroutine woken earlier may have waited somewhere else by the
+time of the dump. Wakeups whose waiting site stays unknown get no arrow; the
+page shows how many (`trace: … · N unknown`). A 5 s trace is about
 6–7 MB at 7,000 requests per second and about 32 MB at 40,000; ruvo reads about
 40 MB/s of it on an Apple M1 Pro and refuses a trace larger than 80 MB. With the
 CLI the trace is parsed in the `ruvo` process. Embedded, everything happens in
@@ -133,19 +170,23 @@ Under the mount path (`/debug/ruvo/`; the flow page serves the same API under
 | `POST api/full` | take a full dump now |
 | `POST api/leaks` | run the `goroutineleak` profile |
 | `POST api/trace?seconds=N` | record a trace for N seconds (1 to 30, default 5); answers 404 unless a view that reads traces, like `flow.View()`, is mounted |
+| `GET api/export` | the session as a zip file (see [Save it](#save-it-and-show-a-colleague)) |
 
 The POSTs return the new snapshot and refuse requests from other sites. A
 snapshot has:
 
 | Field | Meaning |
 |---|---|
+| `seq` | orders snapshots: a later one has a larger `seq` (it follows `at` in microseconds and never goes back) |
 | `at`, `target`, `goroutines`, `interval` | when it was taken, what it watches, how many goroutines there are, how long until the next one |
 | `fullAt`, `fullCount`, `fullCut` | when the last full dump was taken, how many goroutines it holds, and whether it was cut at 64 MB (then `fullCount` is less than `goroutines`) |
 | `leaksAt` | when the `goroutineleak` profile last ran |
 | `traceAt`, `traceFor` | when the last trace ended and how long it ran; `edges` of kind `unblock` come from it |
+| `traceUnknown` | how many wakeups of that trace have no edge because it is not known where the woken goroutines waited |
 | `error` | set when the last read of the target failed; the data is the last good one |
-| `groups` | `id`, `waitSite`, `entry`, `createdBy`, `state`, `count`, `maxWait`, `inFullDump`, `growthPerMin`, `leaked`, `stack`, `std` (no code of yours on the stack) |
-| `edges` | `from`, `to`, `kind` (`unblock` or `spawn`), `count`, and for `unblock` also `wait` (total time the woken goroutines waited) and `waiters`; `from` is a group id, or `network` or `timer` |
+| `offline` | the snapshot comes from a session file: nothing reads the target, and the POSTs answer 409 |
+| `groups` | `id`, `waitSite`, `entry`, `createdBy`, `state`, `count`, `maxWait`, `inFullDump`, `growthPerMin`, `leaked`, `unwoken` (waited through the whole last trace), `stack`, `std` (no code of yours on the stack) |
+| `edges` | `from`, `to`, `kind` (`unblock` or `spawn`), `count`, `approx` (an end was matched to a current group by wait site or start function), and for `unblock` also `wait` (total time the woken goroutines waited) and `waiters`; `from` is a group id, or `network` or `timer` |
 
 ## How it stays cheap
 
@@ -170,6 +211,10 @@ ruvo must not slow down what it watches:
   then cover only those goroutines.
 - `goroutineleak` runs an extra GC cycle, so ruvo never runs it on its own —
   only when you press **Find leaks**.
+- For **Export**, ruvo keeps the text of what it last read — the `debug=1`
+  profile, the full dump (about 250–350 bytes per goroutine), the leak profile —
+  and the last trace, only while it is running; it drops them when it stops.
+  Writing the zip takes about 15 ms for a dump of 100,000 goroutines.
 - A full dump, a leak search or a trace runs at most once per 10 s from the
   last attempt, and everything that asks for one at the same time shares that
   one run. POSTs from other sites are refused.
@@ -179,20 +224,23 @@ ruvo must not slow down what it watches:
 Reading the current process, Apple M1 Pro, Go 1.27.3
 (`go test -bench BenchmarkSample`):
 
-| Goroutines | `debug=1` read | full dump: world stopped | full dump: total |
-|---|---|---|---|
-| 1,000 | 1.2 ms | 2.7 ms | 3 ms |
-| 10,000 | 7.4 ms | 11 ms | 21 ms |
-| 100,000 | 77 ms | 95 ms | 215 ms |
+| Goroutines | `debug=1` read | full dump: world stopped | full dump: total | full dump: allocated |
+|---|---|---|---|---|
+| 1,000 | 0.8 ms | 2.7 ms | 3.1 ms | 1.3 MB |
+| 10,000 | 7.7 ms | 12 ms | 16 ms | 6.2 MB |
+| 100,000 | 83 ms | 104 ms | 151 ms | 59 MB |
 
 The `debug=1` read keeps the world stopped only briefly, whatever the number of
-goroutines. A full dump of your own process stops the world once; parsing runs
-after the pause. A remote target serves the dump with its own
+goroutines; almost all of its cost is `runtime/pprof` formatting the profile.
+A full dump of your own process stops the world once; parsing runs after the
+pause, at about 750 MB/s, and keeps one copy of each distinct stack. Most of
+what a full dump allocates is the dump text itself. A remote target serves the dump with its own
 `net/http/pprof`, which may walk the stacks a few times while it grows its
 buffer.
 
-Resolving the arrows costs about 0.2 ms per snapshot at 1,000 groups (0.4 ms
-with `spawn` arrows). Recording a trace has its own cost, described under
+Publishing a snapshot of 1,000 groups with 20-frame stacks — parsing, groups,
+growth, arrows and the JSON for the page — takes about 7 ms
+(`go test -bench BenchmarkPublish`). Recording a trace has its own cost, described under
 [Who wakes whom](#who-wakes-whom).
 
 ## Try it

@@ -3,6 +3,7 @@ package ruvo
 import (
 	"fmt"
 	"hash/fnv"
+	"strconv"
 	"strings"
 
 	"github.com/TwelfthKyomu/ruvo/internal/dump"
@@ -89,12 +90,35 @@ func isOwn(frames []dump.Frame) bool {
 	return false
 }
 
+const groupCacheMax = 10_000
+
+type stackGroup struct {
+	own   bool
+	id    string
+	site  string
+	entry string
+	stack []string
+	std   bool
+}
+
+type groupCache struct {
+	m   map[string]stackGroup
+	key []byte
+}
+
 func buildGroups(p dump.Profile) (map[string]*Group, int) {
+	var gc groupCache
+
+	return gc.build(p)
+}
+
+func (gc *groupCache) build(p dump.Profile) (map[string]*Group, int) {
 	groups := map[string]*Group{}
 	total := 0
 
 	for _, r := range p.Records {
-		if isOwn(r.Frames) {
+		sg := gc.lookup(r.Frames)
+		if sg.own {
 			continue
 		}
 
@@ -104,19 +128,51 @@ func buildGroups(p dump.Profile) (map[string]*Group, int) {
 			continue
 		}
 
-		site, entry := groupKey(r.Frames)
-		id := groupID(site, entry)
-
-		g := groups[id]
+		g := groups[sg.id]
 		if g == nil {
-			g = &Group{ID: id, WaitSite: site.String(), Entry: entry.Func, Stack: stack(r.Frames), Std: isStd(site.Func)}
-			groups[id] = g
+			g = &Group{ID: sg.id, WaitSite: sg.site, Entry: sg.entry, Stack: sg.stack, Std: sg.std}
+			groups[sg.id] = g
 		}
 
 		g.Count += r.Count
 	}
 
 	return groups, total
+}
+
+func (gc *groupCache) lookup(frames []dump.Frame) stackGroup {
+	gc.key = gc.key[:0]
+
+	for _, f := range frames {
+		gc.key = append(gc.key, f.Func...)
+		gc.key = append(gc.key, 0)
+		gc.key = append(gc.key, f.File...)
+		gc.key = strconv.AppendInt(append(gc.key, 0), int64(f.Line), 10)
+		gc.key = append(gc.key, '\n')
+	}
+
+	if sg, ok := gc.m[string(gc.key)]; ok {
+		return sg
+	}
+
+	sg := stackGroup{own: isOwn(frames)}
+
+	if !sg.own && len(frames) > 0 {
+		site, entry := groupKey(frames)
+		sg.id = groupID(site, entry)
+		sg.site = site.String()
+		sg.entry = entry.Func
+		sg.stack = stack(frames)
+		sg.std = isStd(site.Func)
+	}
+
+	if gc.m == nil || len(gc.m) >= groupCacheMax {
+		gc.m = map[string]stackGroup{}
+	}
+
+	gc.m[string(gc.key)] = sg
+
+	return sg
 }
 
 func stack(frames []dump.Frame) []string {

@@ -24,9 +24,10 @@ var emptyNav = []byte(`<nav id="views"></nav>`)
 var errBadSeconds = fmt.Errorf("seconds must be a whole number from 1 to %d", int(traceMax/time.Second))
 
 type handler struct {
-	c     *collector
-	views map[string]http.Handler
-	cop   *http.CrossOriginProtection
+	c            *collector
+	views        map[string]http.Handler
+	cop          *http.CrossOriginProtection
+	writeTimeout time.Duration
 }
 
 func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -143,6 +144,8 @@ func (h *handler) serveAPI(w http.ResponseWriter, r *http.Request, rel string) {
 		h.serveAction(w, r, func(r *http.Request) (Snapshot, error) { return h.c.captureFull(r.Context()) })
 	case "/api/trace":
 		h.serveAction(w, r, h.captureTrace)
+	case "/api/export":
+		h.serveExport(w, r)
 	default:
 		http.NotFound(w, r)
 	}
@@ -191,6 +194,8 @@ func errorStatus(err error) int {
 		return http.StatusBadRequest
 	case errors.Is(err, errNoTraceReader):
 		return http.StatusNotFound
+	case errors.Is(err, errOffline):
+		return http.StatusConflict
 	}
 
 	return http.StatusBadGateway
@@ -221,11 +226,11 @@ func (h *handler) serveEvents(w http.ResponseWriter, r *http.Request) {
 	s := h.c.snapshot(r.Context())
 
 	first, err := json.Marshal(s)
-	if err != nil || send(rc, func() error { return writeEvent(w, first) }) != nil {
+	if err != nil || send(rc, h.writeTimeout, func() error { return writeEvent(w, first) }) != nil {
 		return
 	}
 
-	last := s.At
+	last := s.Seq
 	tick := time.NewTicker(ping)
 	defer tick.Stop()
 
@@ -236,24 +241,24 @@ func (h *handler) serveEvents(w http.ResponseWriter, r *http.Request) {
 		case <-r.Context().Done():
 			return
 		case m := <-ch:
-			if m.s.At.Equal(last) {
+			if m.s.Seq <= last {
 				continue
 			}
 
-			last = m.s.At
+			last = m.s.Seq
 			write = func() error { return writeEvent(w, m.data) }
 		case <-tick.C:
 			write = func() error { return writePing(w) }
 		}
 
-		if send(rc, write) != nil {
+		if send(rc, h.writeTimeout, write) != nil {
 			return
 		}
 	}
 }
 
-func send(rc *http.ResponseController, write func() error) error {
-	if err := rc.SetWriteDeadline(time.Now().Add(eventWriteTimeout)); err != nil && !errors.Is(err, http.ErrNotSupported) {
+func send(rc *http.ResponseController, timeout time.Duration, write func() error) error {
+	if err := deadline(rc, time.Now().Add(timeout)); err != nil {
 		return err
 	}
 
@@ -261,7 +266,19 @@ func send(rc *http.ResponseController, write func() error) error {
 		return err
 	}
 
-	return rc.Flush()
+	if err := rc.Flush(); err != nil {
+		return err
+	}
+
+	return deadline(rc, time.Time{})
+}
+
+func deadline(rc *http.ResponseController, at time.Time) error {
+	if err := rc.SetWriteDeadline(at); err != nil && !errors.Is(err, http.ErrNotSupported) {
+		return err
+	}
+
+	return nil
 }
 
 func writePing(w io.Writer) error {

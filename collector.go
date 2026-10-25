@@ -15,7 +15,10 @@ import (
 	"github.com/TwelfthKyomu/ruvo/internal/dump"
 )
 
-var errNoTraceReader = errors.New("no view reads traces: mount flow.View()")
+var (
+	errNoTraceReader = errors.New("no view reads traces: mount flow.View()")
+	errOffline       = errors.New("this session was opened from a file: ruvo is not reading the target")
+)
 
 type collector struct {
 	src    collect.Source
@@ -24,18 +27,26 @@ type collector struct {
 
 	mu          sync.Mutex
 	hist        history
+	groups      groupCache
+	enc         bytes.Buffer
 	full        fullState
 	leaks       leakState
 	trace       traceState
 	profile     dump.Profile
-	profileAt   time.Time
+	raw         []byte
+	rawAt       time.Time
 	haveProfile bool
+	reads       uint64
+	applied     uint64
+	seq         int64
 	down        bool
 	readErr     string
 	restart     bool
 	last        Snapshot
 	subs        map[chan message]struct{}
 	running     bool
+	frozen      bool
+	loaded      session
 	active      time.Time
 	interval    time.Duration
 	fullEvery   time.Duration
@@ -50,6 +61,9 @@ type collector struct {
 
 	fmu     sync.Mutex
 	flights map[string]*flight
+
+	pmu  sync.Mutex
+	strs dump.Strings
 }
 
 type message struct {
@@ -78,6 +92,7 @@ func (a attempt) recent(now time.Time) bool {
 
 type fullDump struct {
 	gs   []dump.Goroutine
+	raw  []byte
 	cost time.Duration
 	cut  bool
 }
@@ -96,25 +111,25 @@ func newCollector(src collect.Source) *collector {
 }
 
 func (c *collector) sample(ctx context.Context, withFull bool) Snapshot {
-	at := c.now()
-	p, cost, err := c.fetchStacks(ctx)
-	if err != nil {
-		c.mu.Lock()
-		defer c.mu.Unlock()
-
-		return c.failLocked(c.now(), err)
-	}
+	seq := c.beginRead()
+	p, raw, cost, err := c.fetchStacks(ctx)
 
 	c.mu.Lock()
 	now := c.now()
-	recovered := c.down
-	c.down = false
 
-	if recovered {
-		c.restart = c.full.maxID > 0
+	if !c.applyReadLocked(seq, now, p, raw, err) {
+		defer c.mu.Unlock()
+
+		return c.last
 	}
 
-	if c.restart && (!now.Before(c.nextFull) || (recovered && !c.fullTry.within(now, fullMin))) {
+	if err != nil {
+		defer c.mu.Unlock()
+
+		return c.failLocked(now)
+	}
+
+	if c.restart && !now.Before(c.nextFull) {
 		withFull = true
 	}
 
@@ -138,16 +153,45 @@ func (c *collector) sample(ctx context.Context, withFull bool) Snapshot {
 
 	c.interval = nextInterval(cost, frequentFactor, frequentMin, frequentMax)
 
-	return c.publishLocked(c.now(), c.setProfileLocked(p, at), note)
+	return c.publishLocked(c.now(), true, note)
 }
 
-func (c *collector) setProfileLocked(p dump.Profile, at time.Time) bool {
-	if at.Before(c.profileAt) {
+func (c *collector) beginRead() uint64 {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	c.reads++
+
+	return c.reads
+}
+
+func (c *collector) applyReadLocked(seq uint64, now time.Time, p dump.Profile, raw []byte, err error) bool {
+	if seq < c.applied {
 		return false
 	}
 
+	c.applied = seq
+
+	if err != nil {
+		c.down = true
+		c.readErr = err.Error()
+
+		return true
+	}
+
+	if c.down {
+		c.restart = c.full.maxID > 0
+
+		if c.restart && !c.fullTry.within(now, fullMin) {
+			c.nextFull = now
+		}
+	}
+
+	c.down = false
+	c.readErr = ""
 	c.profile = p
-	c.profileAt = at
+	c.raw = raw
+	c.rawAt = now
 	c.haveProfile = true
 
 	return true
@@ -195,6 +239,10 @@ func (c *collector) fullDoneLocked(fd fullDump, err error) {
 }
 
 func (c *collector) captureFull(ctx context.Context) (Snapshot, error) {
+	if c.frozen {
+		return c.lastSnapshot(), errOffline
+	}
+
 	if !c.hasProfile() {
 		c.refresh(ctx, true)
 	}
@@ -210,6 +258,10 @@ func (c *collector) captureFull(ctx context.Context) (Snapshot, error) {
 }
 
 func (c *collector) captureLeaks(ctx context.Context) (Snapshot, error) {
+	if c.frozen {
+		return c.lastSnapshot(), errOffline
+	}
+
 	if !c.hasProfile() {
 		c.refresh(ctx, true)
 	}
@@ -225,7 +277,7 @@ func (c *collector) captureLeaks(ctx context.Context) (Snapshot, error) {
 			return s, last.err
 		}
 
-		p, err := c.fetchLeaks(ctx)
+		p, raw, err := c.fetchLeaks(ctx)
 
 		c.mu.Lock()
 		defer c.mu.Unlock()
@@ -237,12 +289,17 @@ func (c *collector) captureLeaks(ctx context.Context) (Snapshot, error) {
 		}
 
 		c.leaks.update(c.now(), p)
+		c.leaks.raw = raw
 
 		return c.publishLocked(c.now(), false, ""), nil
 	})
 }
 
 func (c *collector) captureTrace(ctx context.Context, d time.Duration) (Snapshot, error) {
+	if c.frozen {
+		return c.lastSnapshot(), errOffline
+	}
+
 	if c.reader == nil {
 		return Snapshot{}, errNoTraceReader
 	}
@@ -291,7 +348,7 @@ func (c *collector) recordTrace(ctx context.Context, d time.Duration) (Snapshot,
 		}
 	}
 
-	stacks := c.traceStacks(ctx)
+	stacks, dumped := c.traceStacks(ctx)
 
 	<-done
 
@@ -304,22 +361,21 @@ func (c *collector) recordTrace(ctx context.Context, d time.Duration) (Snapshot,
 		return c.traceFailed(fmt.Errorf("read trace: %w", err))
 	}
 
-	edges := traceEdges(ws)
-	at := c.now()
-	p, _, err := c.fetchStacks(ctx)
+	ts := readWakeups(ws)
+	ts.raw, ts.dump = raw, dumped
+	seq := c.beginRead()
+	p, praw, _, err := c.fetchStacks(ctx)
 
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
 	now := c.now()
 	c.traceTry = attempt{at: now}
-	c.trace = traceState{at: now, d: d, edges: edges}
+	ts.at, ts.d = now, d
+	c.trace = ts
+	fresh := c.applyReadLocked(seq, now, p, praw, err)
 
-	if err != nil {
-		return c.publishLocked(now, false, err.Error()), nil
-	}
-
-	return c.publishLocked(now, c.setProfileLocked(p, at), ""), nil
+	return c.publishLocked(now, fresh && err == nil, ""), nil
 }
 
 func readTrace(r TraceReader, raw []byte, stacks map[int64][]Frame) (ws []Wakeup, err error) {
@@ -332,10 +388,10 @@ func readTrace(r TraceReader, raw []byte, stacks map[int64][]Frame) (ws []Wakeup
 	return r.ReadTrace(bytes.NewReader(raw), stacks)
 }
 
-func (c *collector) traceStacks(ctx context.Context) map[int64][]Frame {
+func (c *collector) traceStacks(ctx context.Context) (map[int64][]Frame, []byte) {
 	fd, err := c.fullFlight(ctx, true)
 	if err != nil || len(fd.gs) == 0 {
-		return nil
+		return nil, nil
 	}
 
 	stacks := make(map[int64][]Frame, len(fd.gs))
@@ -344,7 +400,7 @@ func (c *collector) traceStacks(ctx context.Context) map[int64][]Frame {
 		stacks[g.ID] = traceFrames(g.Frames)
 	}
 
-	return stacks
+	return stacks, fd.raw
 }
 
 func (c *collector) traceFailed(err error) (Snapshot, error) {
@@ -358,6 +414,13 @@ func (c *collector) traceFailed(err error) (Snapshot, error) {
 
 func (c *collector) snapshot(ctx context.Context) Snapshot {
 	c.mu.Lock()
+
+	if c.frozen {
+		defer c.mu.Unlock()
+
+		return c.last
+	}
+
 	now := c.now()
 	c.active = now
 	c.startLocked()
@@ -479,12 +542,22 @@ func (c *collector) lastSnapshot() Snapshot {
 	return c.last
 }
 
+func (c *collector) stopLocked() {
+	c.running = false
+	c.raw = nil
+	c.rawAt = time.Time{}
+	c.full.raw = nil
+	c.leaks.raw = nil
+	c.trace.raw = nil
+	c.trace.dump = nil
+}
+
 func (c *collector) idleLocked(now time.Time) bool {
 	return len(c.subs) == 0 && now.Sub(c.active) > idleStop
 }
 
 func (c *collector) startLocked() {
-	if c.running {
+	if c.running || c.frozen {
 		return
 	}
 
@@ -512,7 +585,7 @@ func (c *collector) loop() {
 		now := c.now()
 
 		if c.idleLocked(now) {
-			c.running = false
+			c.stopLocked()
 			c.mu.Unlock()
 
 			return
@@ -525,17 +598,20 @@ func (c *collector) loop() {
 	}
 }
 
-func (c *collector) fetchStacks(ctx context.Context) (dump.Profile, time.Duration, error) {
+func (c *collector) fetchStacks(ctx context.Context) (dump.Profile, []byte, time.Duration, error) {
 	start := time.Now()
 
 	raw, err := c.src.Goroutines(ctx, 1)
 	if err != nil {
-		return dump.Profile{}, 0, err
+		return dump.Profile{}, nil, 0, err
 	}
 
-	p, err := dump.ParseStacks(bytes.NewReader(raw))
+	c.pmu.Lock()
+	defer c.pmu.Unlock()
 
-	return p, time.Since(start), err
+	p, err := c.strs.ParseStacks(raw)
+
+	return p, raw, time.Since(start), err
 }
 
 func (c *collector) fetchFull(ctx context.Context) (fullDump, error) {
@@ -546,22 +622,24 @@ func (c *collector) fetchFull(ctx context.Context) (fullDump, error) {
 		return fullDump{}, err
 	}
 
-	gs, err := dump.ParseFull(bytes.NewReader(raw))
+	gs, err := dump.ParseFull(raw)
 
-	return fullDump{gs: gs, cost: time.Since(start), cut: len(raw) >= c.fullCap}, err
+	return fullDump{gs: gs, raw: raw, cost: time.Since(start), cut: len(raw) >= c.fullCap}, err
 }
 
-func (c *collector) fetchLeaks(ctx context.Context) (dump.Profile, error) {
+func (c *collector) fetchLeaks(ctx context.Context) (dump.Profile, []byte, error) {
 	raw, err := c.src.Leaks(ctx)
 	if err != nil {
-		return dump.Profile{}, err
+		return dump.Profile{}, nil, err
 	}
 
-	return dump.ParseStacks(bytes.NewReader(raw))
+	p, err := dump.ParseStacks(raw)
+
+	return p, raw, err
 }
 
 func (c *collector) applyFullLocked(now time.Time, fd fullDump) {
-	if c.restart && maxID(fd.gs) < c.full.maxID {
+	if c.restart && !fd.cut && maxID(fd.gs) < c.full.maxID {
 		c.hist = history{window: historyWindow}
 		c.leaks = leakState{}
 		c.full = fullState{}
@@ -571,6 +649,7 @@ func (c *collector) applyFullLocked(now time.Time, fd fullDump) {
 	c.restart = false
 	c.full.update(now, fd.gs)
 	c.full.cut = fd.cut
+	c.full.raw = fd.raw
 	c.fullEvery = nextInterval(fd.cost, fullFactor, fullMin, fullMax)
 	c.nextFull = now.Add(c.fullEvery)
 }
@@ -585,9 +664,9 @@ func maxID(gs []dump.Goroutine) int64 {
 	return m
 }
 
-func (c *collector) failLocked(now time.Time, err error) Snapshot {
-	c.down = true
-	c.readErr = err.Error()
+func (c *collector) failLocked(now time.Time) Snapshot {
+	c.seq = max(c.seq+1, now.UnixMicro())
+	c.last.Seq = c.seq
 	c.last.At = now
 	c.last.Target = c.src.Name()
 	c.last.Interval = c.interval
@@ -607,7 +686,10 @@ func (c *collector) failLocked(now time.Time, err error) Snapshot {
 }
 
 func (c *collector) publishLocked(now time.Time, record bool, note string) Snapshot {
-	groups, total := buildGroups(c.profile)
+	groups, total := c.groups.build(c.profile)
+	idx := newGroupIndex(groups)
+	edges := c.edgesLocked(idx)
+	c.markUnwokenLocked(idx)
 	counts := make(map[string]int, len(groups))
 	out := make([]Group, 0, len(groups))
 
@@ -644,20 +726,23 @@ func (c *collector) publishLocked(now time.Time, record bool, note string) Snaps
 		return cmp.Or(cmp.Compare(b.Count, a.Count), cmp.Compare(a.ID, b.ID))
 	})
 
+	c.seq = max(c.seq+1, now.UnixMicro())
 	c.last = Snapshot{
-		At:         now,
-		Target:     c.src.Name(),
-		Goroutines: total,
-		Interval:   c.interval,
-		FullAt:     c.full.at,
-		FullCount:  c.full.count,
-		FullCut:    c.full.cut,
-		LeaksAt:    c.leaks.at,
-		TraceAt:    c.trace.at,
-		TraceFor:   c.trace.d,
-		Error:      note,
-		Groups:     out,
-		Edges:      c.edgesLocked(groups),
+		Seq:          c.seq,
+		At:           now,
+		Target:       c.src.Name(),
+		Goroutines:   total,
+		Interval:     c.interval,
+		FullAt:       c.full.at,
+		FullCount:    c.full.count,
+		FullCut:      c.full.cut,
+		LeaksAt:      c.leaks.at,
+		TraceAt:      c.trace.at,
+		TraceFor:     c.trace.d,
+		TraceUnknown: c.trace.unknown,
+		Error:        note,
+		Groups:       out,
+		Edges:        edges,
 	}
 
 	c.broadcastLocked(c.last)
@@ -670,12 +755,13 @@ func (c *collector) broadcastLocked(s Snapshot) {
 		return
 	}
 
-	data, err := json.Marshal(s)
-	if err != nil {
+	c.enc.Reset()
+
+	if err := json.NewEncoder(&c.enc).Encode(s); err != nil {
 		return
 	}
 
-	m := message{s: s, data: data}
+	m := message{s: s, data: bytes.Clone(bytes.TrimSuffix(c.enc.Bytes(), []byte("\n")))}
 
 	for ch := range c.subs {
 		select {

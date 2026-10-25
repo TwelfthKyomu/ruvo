@@ -34,10 +34,12 @@ func (h *history) growth(id string, now time.Time, current int) float64 {
 		points           = 1.0
 	)
 
-	for _, s := range h.samples {
+	for i := len(h.samples) - 1; i >= 0; i-- {
+		s := h.samples[i]
+
 		age := now.Sub(s.at)
 		if age > growthSpan {
-			continue
+			break
 		}
 
 		c, ok := s.counts[id]

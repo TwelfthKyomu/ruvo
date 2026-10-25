@@ -1040,3 +1040,163 @@ func TestSpawnEdgesFollowLatestFullDump(t *testing.T) {
 		t.Fatalf("edges %+v, fullAt %v, want no edges from the new full dump", s.Edges, s.FullAt)
 	}
 }
+
+func TestEmptyFullKeepsLastGoodDump(t *testing.T) {
+	src := newFake(t, "stacks.txt", "full.txt", "")
+	c, clk := newTestCollector(t, src)
+
+	before := c.sample(context.Background(), true)
+	if before.FullCount == 0 {
+		t.Fatal("no full dump to begin with")
+	}
+
+	clk.set(t0.Add(time.Minute))
+	src.set(func(f *fakeSource) { f.debug2 = []byte{} })
+
+	if _, err := c.captureFull(context.Background()); err == nil {
+		t.Fatal("an empty debug=2 body was taken for a dump")
+	}
+
+	s := c.lastSnapshot()
+	if s.FullCount != before.FullCount || !s.FullAt.Equal(t0) {
+		t.Fatalf("fullCount %d (was %d), fullAt %v: a failed dump must keep the last good one", s.FullCount, before.FullCount, s.FullAt)
+	}
+
+	g, ok := groupByEntry(s, "main.(*pipeline).worker")
+	if !ok || !g.InFullDump || g.State != "sleep" {
+		t.Fatalf("worker group %+v (found %v): it lost what the last good dump said", g, ok)
+	}
+}
+
+type gatedSource struct {
+	*fakeSource
+	mu    sync.Mutex
+	calls int
+	first chan struct{}
+}
+
+func (s *gatedSource) Goroutines(ctx context.Context, debug int) ([]byte, error) {
+	if debug == 1 {
+		s.mu.Lock()
+		s.calls++
+		n := s.calls
+		s.mu.Unlock()
+
+		if n == 1 {
+			<-s.first
+
+			return nil, errors.New("old request failed")
+		}
+	}
+
+	return s.fakeSource.Goroutines(ctx, debug)
+}
+
+func TestLateFailedReadDoesNotOverrideNewer(t *testing.T) {
+	src := &gatedSource{fakeSource: &fakeSource{debug1: stacksText(20)}, first: make(chan struct{})}
+	c := newCollector(src)
+	t.Cleanup(c.close)
+
+	old := make(chan Snapshot)
+
+	go func() { old <- c.sample(context.Background(), false) }()
+
+	waitFor(t, time.Second, func() bool {
+		src.mu.Lock()
+		defer src.mu.Unlock()
+
+		return src.calls == 1
+	})
+
+	if s := c.sample(context.Background(), false); s.Goroutines != 20 || s.Error != "" {
+		t.Fatalf("newer read: %d goroutines, error %q", s.Goroutines, s.Error)
+	}
+
+	close(src.first)
+	<-old
+
+	s := c.lastSnapshot()
+
+	c.mu.Lock()
+	down := c.down
+	c.mu.Unlock()
+
+	if s.Goroutines != 20 || s.Error != "" || down {
+		t.Fatalf("%d goroutines, error %q, down %v: an older failure must not override a newer success", s.Goroutines, s.Error, down)
+	}
+}
+
+func TestTruncatedDumpDoesNotProveRestart(t *testing.T) {
+	src := newFake(t, "stacks.txt", "full.txt", "leak.txt")
+	c, clk := newTestCollector(t, src)
+	c.reader = &fakeReader{wakeups: []Wakeup{{Cause: CauseNetwork, Waiter: workerStack, Count: 1, Waiters: 1, Wait: time.Second}}}
+	c.sample(context.Background(), true)
+	c.captureLeaks(context.Background())
+
+	if _, err := c.captureTrace(context.Background(), traceDefault); err != nil {
+		t.Fatal(err)
+	}
+
+	clk.set(t0.Add(2 * time.Minute))
+	src.set(func(f *fakeSource) { f.err = errors.New("connection refused") })
+	c.sample(context.Background(), false)
+
+	clk.set(t0.Add(3 * time.Minute))
+	src.set(func(f *fakeSource) {
+		f.err = nil
+		f.debug2 = restarted
+	})
+
+	c.mu.Lock()
+	c.fullCap = len(restarted)
+	c.mu.Unlock()
+
+	s := c.sample(context.Background(), false)
+
+	if !s.FullCut || !s.LeaksAt.Equal(t0) || !s.TraceAt.Equal(t0) {
+		t.Fatalf("fullCut %v, leaksAt %v, traceAt %v: a cut dump has no say about restarts", s.FullCut, s.LeaksAt, s.TraceAt)
+	}
+}
+
+func TestSuccessfulTraceClearsReadOutage(t *testing.T) {
+	src := newFake(t, "stacks.txt", "full.txt", "")
+	c, clk := newTestCollector(t, src)
+	c.reader = &fakeReader{wakeups: []Wakeup{{Cause: CauseNetwork, Waiter: workerStack, Count: 1, Waiters: 1, Wait: time.Second}}}
+	c.sample(context.Background(), false)
+
+	clk.set(t0.Add(30 * time.Second))
+	src.set(func(f *fakeSource) { f.err = errors.New("target offline") })
+	c.sample(context.Background(), false)
+
+	clk.set(t0.Add(40 * time.Second))
+	src.set(func(f *fakeSource) { f.err = nil })
+
+	s, err := c.captureTrace(context.Background(), traceDefault)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	c.mu.Lock()
+	down := c.down
+	c.mu.Unlock()
+
+	if s.Error != "" || down || len(s.Edges) != 1 {
+		t.Fatalf("error %q, down %v, %d edges: a good read after the trace means the target is back", s.Error, down, len(s.Edges))
+	}
+}
+
+func TestSeqGrowsWithinOneInstant(t *testing.T) {
+	src := newFake(t, "stacks.txt", "", "")
+	c, _ := newTestCollector(t, src)
+
+	a := c.sample(context.Background(), false)
+	b := c.sample(context.Background(), false)
+
+	src.set(func(f *fakeSource) { f.err = errors.New("connection refused") })
+
+	e := c.sample(context.Background(), false)
+
+	if !a.At.Equal(b.At) || !(a.Seq < b.Seq && b.Seq < e.Seq) || a.Seq < t0.UnixMicro() {
+		t.Fatalf("seq %d, %d, %d at %v, %v: snapshots of one instant must still be ordered", a.Seq, b.Seq, e.Seq, a.At, b.At)
+	}
+}

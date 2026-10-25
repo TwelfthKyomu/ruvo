@@ -1,7 +1,6 @@
 package ruvo
 
 import (
-	"bytes"
 	"context"
 	"fmt"
 	"sync"
@@ -77,7 +76,7 @@ func BenchmarkSample(b *testing.B) {
 
 				walk += time.Since(start)
 
-				gs, err := dump.ParseFull(bytes.NewReader(raw))
+				gs, err := dump.ParseFull(raw)
 				if err != nil {
 					b.Fatal(err)
 				}
@@ -158,7 +157,7 @@ func BenchmarkEdges(b *testing.B) {
 	b.ReportAllocs()
 
 	for b.Loop() {
-		c.edgesLocked(gs)
+		c.edgesLocked(newGroupIndex(gs))
 	}
 
 	b.ReportMetric(groups, "groups")
@@ -180,9 +179,117 @@ func BenchmarkSpawnEdges(b *testing.B) {
 	b.ReportAllocs()
 
 	for b.Loop() {
-		c.edgesLocked(gs)
+		c.edgesLocked(newGroupIndex(gs))
 	}
 
 	b.ReportMetric(groups, "groups")
 	b.ReportMetric(float64(len(spawns)), "edges")
+}
+
+func manyStacks(groups, depth int) []byte {
+	var b []byte
+
+	b = fmt.Appendf(b, "goroutine profile: total %d\n", groups*3)
+
+	for i := range groups {
+		b = fmt.Appendf(b, "3 @ 0x1\n#\t0x1\tinternal/poll.runtime_pollWait+0x1\t/usr/local/go/src/runtime/netpoll.go:351\n")
+
+		for d := range depth {
+			b = fmt.Appendf(b, "#\t0x1\tgithub.com/acme/service/internal/layer%d.(*Handler).Step%d+0x1\t/home/dev/service/internal/layer%d/handler.go:%d\n", d, i, d, 10+d)
+		}
+
+		b = append(b, '\n')
+	}
+
+	return b
+}
+
+func BenchmarkPublish(b *testing.B) {
+	for _, groups := range []int{100, 1000} {
+		raw := manyStacks(groups, 20)
+
+		b.Run(fmt.Sprintf("%dgroups", groups), func(b *testing.B) {
+			c := newCollector(collect.Local())
+			defer c.close()
+
+			at := t0
+			c.now = func() time.Time {
+				at = at.Add(frequentMin)
+
+				return at
+			}
+
+			_, cancel := c.subscribe()
+			defer cancel()
+
+			b.SetBytes(int64(len(raw)))
+			b.ReportAllocs()
+
+			for b.Loop() {
+				p, err := c.strs.ParseStacks(raw)
+				if err != nil {
+					b.Fatal(err)
+				}
+
+				c.mu.Lock()
+				c.profile = p
+				c.publishLocked(c.now(), true, "")
+				c.mu.Unlock()
+			}
+		})
+	}
+}
+
+func BenchmarkExport(b *testing.B) {
+	for _, n := range []int{10_000, 100_000} {
+		b.Run(fmt.Sprintf("%dk", n/1000), func(b *testing.B) {
+			release := park(n)
+			defer release()
+
+			c := newCollector(collect.Local())
+			defer c.close()
+
+			ctx := context.Background()
+			c.sample(ctx, false)
+
+			if _, err := c.captureFull(ctx); err != nil {
+				b.Fatal(err)
+			}
+
+			s := c.session(ctx)
+			size := 0
+
+			for _, f := range s.info.Files {
+				size += len(f.data)
+			}
+
+			b.SetBytes(int64(size))
+			b.ReportAllocs()
+
+			var out int64
+
+			for b.Loop() {
+				w := &counter{}
+
+				if err := writeSession(w, s); err != nil {
+					b.Fatal(err)
+				}
+
+				out = w.n
+			}
+
+			b.ReportMetric(float64(size)/(1<<20), "raw-MB")
+			b.ReportMetric(float64(out)/(1<<20), "zip-MB")
+		})
+	}
+}
+
+type counter struct {
+	n int64
+}
+
+func (c *counter) Write(p []byte) (int, error) {
+	c.n += int64(len(p))
+
+	return len(p), nil
 }

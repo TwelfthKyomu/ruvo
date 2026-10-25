@@ -1,9 +1,8 @@
 package dump
 
 import (
-	"bufio"
+	"bytes"
 	"fmt"
-	"io"
 	"strconv"
 	"strings"
 )
@@ -30,35 +29,108 @@ func base(file string) string {
 	return file
 }
 
-func parseFileLine(s string) (string, int, bool) {
-	s = strings.TrimSpace(s)
+func parseFileLine(s []byte) ([]byte, int, bool) {
+	s = bytes.TrimSpace(s)
 
-	if i := strings.Index(s, " +0x"); i >= 0 {
+	if i := bytes.Index(s, []byte(" +0x")); i >= 0 {
 		s = s[:i]
 	}
 
-	i := strings.LastIndexByte(s, ':')
+	i := bytes.LastIndexByte(s, ':')
 	if i < 0 {
-		return "", 0, false
+		return nil, 0, false
 	}
 
-	n, err := strconv.Atoi(s[i+1:])
-	if err != nil {
-		return "", 0, false
+	n, ok := atoi(s[i+1:])
+	if !ok {
+		return nil, 0, false
 	}
 
 	return s[:i], n, true
 }
 
-func newScanner(r io.Reader) *bufio.Scanner {
-	sc := bufio.NewScanner(r)
-	sc.Buffer(make([]byte, 64*1024), 1<<20)
+func atoi(b []byte) (int, bool) {
+	if len(b) == 0 || len(b) > 18 {
+		return 0, false
+	}
 
-	return sc
+	n := 0
+
+	for _, c := range b {
+		if c < '0' || c > '9' {
+			return 0, false
+		}
+
+		n = n*10 + int(c-'0')
+	}
+
+	return n, true
 }
 
-func quote(s string) string {
-	if len(s) > 60 {
+func signedAtoi(b []byte) (int, bool) {
+	if len(b) > 0 && b[0] == '-' {
+		n, ok := atoi(b[1:])
+
+		return -n, ok
+	}
+
+	if len(b) > 0 && b[0] == '+' {
+		b = b[1:]
+	}
+
+	return atoi(b)
+}
+
+type lines struct {
+	data []byte
+}
+
+func (l *lines) next() ([]byte, bool) {
+	if len(l.data) == 0 {
+		return nil, false
+	}
+
+	var line []byte
+
+	if i := bytes.IndexByte(l.data, '\n'); i >= 0 {
+		line, l.data = l.data[:i], l.data[i+1:]
+	} else {
+		line, l.data = l.data, nil
+	}
+
+	if n := len(line); n > 0 && line[n-1] == '\r' {
+		line = line[:n-1]
+	}
+
+	return line, true
+}
+
+const stringsMax = 50_000
+
+type Strings map[string]string
+
+func (in Strings) str(b []byte) string {
+	if s, ok := in[string(b)]; ok {
+		return s
+	}
+
+	s := string(b)
+	in[s] = s
+
+	return s
+}
+
+func (in *Strings) ready() Strings {
+	if *in == nil || len(*in) >= stringsMax {
+		*in = Strings{}
+	}
+
+	return *in
+}
+
+func quote(b []byte) string {
+	s := string(b[:min(len(b), 61)])
+	if len(b) > 60 {
 		s = s[:60] + "…"
 	}
 
