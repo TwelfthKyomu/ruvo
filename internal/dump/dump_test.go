@@ -60,6 +60,35 @@ func TestParseStacksLeakHeader(t *testing.T) {
 	}
 }
 
+func TestParseStacksRejectsDamaged(t *testing.T) {
+	for name, body := range map[string]string{
+		"incomplete":     "goroutine profile: total 5\n2 @ 0x1 0x2\n",
+		"header only":    "goroutine profile: total 3\n",
+		"negative total": "goroutine profile: total -1\n",
+		"zero count":     "goroutine profile: total 0\n0 @ 0x1\n",
+		"negative count": "goroutine profile: total 1\n-1 @ 0x1\n2 @ 0x2\n",
+	} {
+		if _, err := ParseStacks(strings.NewReader(body)); err == nil {
+			t.Errorf("%s: want error", name)
+		}
+	}
+
+	p, err := ParseStacks(strings.NewReader("goroutine profile: total 0\n"))
+	if err != nil || len(p.Records) != 0 {
+		t.Fatalf("empty profile: %v, %+v", err, p)
+	}
+
+	p, err = ParseStacks(strings.NewReader("goroutine profile: total 1\n1 @ 0x1 0x2\n"))
+	if err != nil || len(p.Records) != 1 || len(p.Records[0].Frames) != 0 {
+		t.Fatalf("frameless record: %v, %+v", err, p)
+	}
+
+	p, err = ParseStacks(strings.NewReader("goroutine profile: total 3\n1 @\n\n2 @ 0x1\n#\t0x1\tmain.f+0x1\t/x/main.go:3\n"))
+	if err != nil || len(p.Records) != 2 || len(p.Records[0].Frames) != 0 || p.Records[1].Count != 2 {
+		t.Fatalf("record without addresses: %v, %+v", err, p)
+	}
+}
+
 func TestParseStacksRejectsGarbage(t *testing.T) {
 	if _, err := ParseStacks(strings.NewReader("<html>404 page not found</html>")); err == nil {
 		t.Fatal("want error for a non-profile body")
@@ -115,6 +144,25 @@ func TestParseFullTruncated(t *testing.T) {
 
 	if !reflect.DeepEqual(ids, []int64{652, 9}) {
 		t.Fatalf("ids %v, want [652 9]", ids)
+	}
+}
+
+func TestParseFullAncestors(t *testing.T) {
+	body := "goroutine 5 [chan receive]:\nmain.work()\n\t/app/main.go:20 +0x1\ncreated by main.start in goroutine 1\n\t/app/main.go:10 +0x2\n" +
+		"[originating from goroutine 1]:\nmain.start()\n\t/app/main.go:9 +0x3\ncreated by main.main in goroutine 0\n\t/app/main.go:5 +0x4\n\n" +
+		"goroutine 6 [select]:\nmain.other()\n\t/app/main.go:30 +0x5\n"
+
+	gs, err := ParseFull(strings.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if len(gs) != 2 || gs[0].ID != 5 || len(gs[0].Frames) != 1 || gs[0].Frames[0].Func != "main.work" {
+		t.Fatalf("goroutines %+v", gs)
+	}
+
+	if gs[0].CreatedBy.Func != "main.start" || gs[0].CreatedBy.Line != 10 || gs[0].Creator != 1 || gs[1].ID != 6 {
+		t.Fatalf("created by %+v, creator %d, second %d", gs[0].CreatedBy, gs[0].Creator, gs[1].ID)
 	}
 }
 

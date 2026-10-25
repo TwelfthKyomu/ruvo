@@ -15,7 +15,10 @@ import (
 
 // View is an extra page that draws snapshots its own way. Its handler is
 // mounted at /<Name>/ next to the built-in list; api serves the JSON API
-// (api/snapshot, api/events, api/leaks, api/full) relative to the view.
+// (api/snapshot, api/events, api/leaks, api/full, api/trace) relative to the
+// view. A view that also implements TraceReader turns on api/trace, which
+// records an execution trace of the target and adds unblock edges to the
+// snapshot; if several views do, the first one reads the traces.
 type View interface {
 	Name() string
 	Handler(api http.Handler) http.Handler
@@ -42,9 +45,9 @@ func Remote(baseURL string) Source {
 
 // Handler serves the ruvo page and API for the current process. Mount it
 // under a path that ends in a slash, on a listener that only you can reach:
-// the page shows every stack and can trigger full dumps. It starts reading
-// goroutines on the first request and stops ten minutes after the last
-// viewer leaves.
+// the page shows every stack and can trigger full dumps and execution
+// traces. It starts reading goroutines on the first request and stops ten
+// minutes after the last viewer leaves.
 func Handler(views ...View) http.Handler {
 	return NewHandler(Local(), views...)
 }
@@ -60,6 +63,10 @@ func NewHandler(src Source, views ...View) http.Handler {
 
 	for _, v := range views {
 		h.views[v.Name()] = v.Handler(api)
+
+		if r, ok := v.(TraceReader); ok && h.c.reader == nil {
+			h.c.reader = r
+		}
 	}
 
 	return h

@@ -5,6 +5,8 @@ import (
 	"cmp"
 	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"slices"
 	"sync"
 	"time"
@@ -13,17 +15,24 @@ import (
 	"github.com/TwelfthKyomu/ruvo/internal/dump"
 )
 
+var errNoTraceReader = errors.New("no view reads traces: mount flow.View()")
+
 type collector struct {
-	src collect.Source
-	now func() time.Time
+	src    collect.Source
+	reader TraceReader
+	now    func() time.Time
 
 	mu          sync.Mutex
 	hist        history
 	full        fullState
 	leaks       leakState
+	trace       traceState
 	profile     dump.Profile
+	profileAt   time.Time
 	haveProfile bool
 	down        bool
+	readErr     string
+	restart     bool
 	last        Snapshot
 	subs        map[chan message]struct{}
 	running     bool
@@ -31,6 +40,10 @@ type collector struct {
 	interval    time.Duration
 	fullEvery   time.Duration
 	nextFull    time.Time
+	fullTry     attempt
+	leaksTry    attempt
+	traceTry    attempt
+	fullCap     int
 
 	done      chan struct{}
 	closeOnce sync.Once
@@ -50,9 +63,23 @@ type flight struct {
 	err  error
 }
 
+type attempt struct {
+	at  time.Time
+	err error
+}
+
+func (a attempt) within(now time.Time, d time.Duration) bool {
+	return !a.at.IsZero() && now.Sub(a.at) < d
+}
+
+func (a attempt) recent(now time.Time) bool {
+	return a.within(now, actionGap)
+}
+
 type fullDump struct {
 	gs   []dump.Goroutine
 	cost time.Duration
+	cut  bool
 }
 
 func newCollector(src collect.Source) *collector {
@@ -63,11 +90,13 @@ func newCollector(src collect.Source) *collector {
 		subs:      map[chan message]struct{}{},
 		interval:  frequentMin,
 		fullEvery: fullMin,
+		fullCap:   fullDumpCap,
 		done:      make(chan struct{}),
 	}
 }
 
 func (c *collector) sample(ctx context.Context, withFull bool) Snapshot {
+	at := c.now()
 	p, cost, err := c.fetchStacks(ctx)
 	if err != nil {
 		c.mu.Lock()
@@ -77,20 +106,29 @@ func (c *collector) sample(ctx context.Context, withFull bool) Snapshot {
 	}
 
 	c.mu.Lock()
-	recovering := c.down
+	now := c.now()
+	recovered := c.down
 	c.down = false
 
-	if withFull && !recovering && c.full.at.IsZero() && p.Total > firstFullLimit {
+	if recovered {
+		c.restart = c.full.maxID > 0
+	}
+
+	if c.restart && (!now.Before(c.nextFull) || (recovered && !c.fullTry.within(now, fullMin))) {
+		withFull = true
+	}
+
+	if withFull && c.nextFull.IsZero() && p.Total > firstFullLimit {
 		withFull = false
-		c.nextFull = c.now().Add(fullMin)
+		c.nextFull = now.Add(fullMin)
 	}
 
 	c.mu.Unlock()
 
 	note := ""
 
-	if withFull || recovering {
-		if err := c.refreshFull(ctx, recovering); err != nil {
+	if withFull {
+		if err := c.refreshFull(context.WithoutCancel(ctx), false); err != nil {
 			note = "full dump: " + err.Error()
 		}
 	}
@@ -99,20 +137,37 @@ func (c *collector) sample(ctx context.Context, withFull bool) Snapshot {
 	defer c.mu.Unlock()
 
 	c.interval = nextInterval(cost, frequentFactor, frequentMin, frequentMax)
-	c.profile = p
-	c.haveProfile = true
 
-	return c.publishLocked(c.now(), true, note)
+	return c.publishLocked(c.now(), c.setProfileLocked(p, at), note)
 }
 
-func (c *collector) refreshFull(ctx context.Context, recovering bool) error {
-	_, err := shared(ctx, c, "full", func(ctx context.Context) (struct{}, error) {
+func (c *collector) setProfileLocked(p dump.Profile, at time.Time) bool {
+	if at.Before(c.profileAt) {
+		return false
+	}
+
+	c.profile = p
+	c.profileAt = at
+	c.haveProfile = true
+
+	return true
+}
+
+func (c *collector) refreshFull(ctx context.Context, manual bool) error {
+	_, err := c.fullFlight(ctx, manual)
+
+	return err
+}
+
+func (c *collector) fullFlight(ctx context.Context, manual bool) (fullDump, error) {
+	return shared(ctx, c, "full", fetchTimeout, func(ctx context.Context) (fullDump, error) {
 		c.mu.Lock()
-		recent := !c.full.at.IsZero() && c.now().Sub(c.full.at) < actionGap
+		last := c.fullTry
+		skip := last.recent(c.now()) && (manual || !c.restart)
 		c.mu.Unlock()
 
-		if recent && !recovering {
-			return struct{}{}, nil
+		if skip {
+			return fullDump{}, last.err
 		}
 
 		fd, err := c.fetchFull(ctx)
@@ -120,27 +175,31 @@ func (c *collector) refreshFull(ctx context.Context, recovering bool) error {
 		c.mu.Lock()
 		defer c.mu.Unlock()
 
-		if err != nil {
-			c.fullEvery = min(2*c.fullEvery, fullMax)
-			c.nextFull = c.now().Add(c.fullEvery)
+		c.fullDoneLocked(fd, err)
 
-			return struct{}{}, err
-		}
-
-		c.applyFullLocked(c.now(), fd, recovering)
-
-		return struct{}{}, nil
+		return fd, err
 	})
+}
 
-	return err
+func (c *collector) fullDoneLocked(fd fullDump, err error) {
+	c.fullTry = attempt{at: c.now(), err: err}
+
+	if err != nil {
+		c.fullEvery = min(2*c.fullEvery, fullMax)
+		c.nextFull = c.now().Add(c.fullEvery)
+
+		return
+	}
+
+	c.applyFullLocked(c.now(), fd)
 }
 
 func (c *collector) captureFull(ctx context.Context) (Snapshot, error) {
 	if !c.hasProfile() {
-		c.first(ctx)
+		c.refresh(ctx, true)
 	}
 
-	if err := c.refreshFull(ctx, false); err != nil {
+	if err := c.refreshFull(ctx, true); err != nil {
 		return c.lastSnapshot(), err
 	}
 
@@ -152,36 +211,149 @@ func (c *collector) captureFull(ctx context.Context) (Snapshot, error) {
 
 func (c *collector) captureLeaks(ctx context.Context) (Snapshot, error) {
 	if !c.hasProfile() {
-		c.first(ctx)
+		c.refresh(ctx, true)
 	}
 
-	return shared(ctx, c, "leaks", func(ctx context.Context) (Snapshot, error) {
+	return shared(ctx, c, "leaks", fetchTimeout, func(ctx context.Context) (Snapshot, error) {
 		c.mu.Lock()
-		recent := !c.leaks.at.IsZero() && c.now().Sub(c.leaks.at) < actionGap
-		last := c.last
+		last := c.leaksTry
+		recent := last.recent(c.now())
+		s := c.last
 		c.mu.Unlock()
 
 		if recent {
-			return last, nil
+			return s, last.err
 		}
 
-		raw, err := c.src.Leaks(ctx)
-		if err != nil {
-			return c.lastSnapshot(), err
-		}
-
-		p, err := dump.ParseStacks(bytes.NewReader(raw))
-		if err != nil {
-			return c.lastSnapshot(), err
-		}
+		p, err := c.fetchLeaks(ctx)
 
 		c.mu.Lock()
 		defer c.mu.Unlock()
+
+		c.leaksTry = attempt{at: c.now(), err: err}
+
+		if err != nil {
+			return c.last, err
+		}
 
 		c.leaks.update(c.now(), p)
 
 		return c.publishLocked(c.now(), false, ""), nil
 	})
+}
+
+func (c *collector) captureTrace(ctx context.Context, d time.Duration) (Snapshot, error) {
+	if c.reader == nil {
+		return Snapshot{}, errNoTraceReader
+	}
+
+	if !c.hasProfile() {
+		c.refresh(ctx, false)
+	}
+
+	return shared(ctx, c, "trace", d+fetchTimeout, func(ctx context.Context) (Snapshot, error) {
+		c.mu.Lock()
+		last := c.traceTry
+		recent := last.recent(c.now())
+		s := c.last
+		c.mu.Unlock()
+
+		if recent {
+			return s, last.err
+		}
+
+		return c.recordTrace(ctx, d)
+	})
+}
+
+func (c *collector) recordTrace(ctx context.Context, d time.Duration) (Snapshot, error) {
+	var (
+		raw  []byte
+		terr error
+	)
+
+	done := make(chan struct{})
+
+	go func() {
+		defer close(done)
+
+		raw, terr = c.src.Trace(ctx, d)
+	}()
+
+	timer := time.NewTimer(min(traceDumpDelay, d/2))
+	defer timer.Stop()
+
+	select {
+	case <-timer.C:
+	case <-done:
+		if terr != nil {
+			return c.traceFailed(terr)
+		}
+	}
+
+	stacks := c.traceStacks(ctx)
+
+	<-done
+
+	if terr != nil {
+		return c.traceFailed(terr)
+	}
+
+	ws, err := readTrace(c.reader, raw, stacks)
+	if err != nil {
+		return c.traceFailed(fmt.Errorf("read trace: %w", err))
+	}
+
+	edges := traceEdges(ws)
+	at := c.now()
+	p, _, err := c.fetchStacks(ctx)
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	now := c.now()
+	c.traceTry = attempt{at: now}
+	c.trace = traceState{at: now, d: d, edges: edges}
+
+	if err != nil {
+		return c.publishLocked(now, false, err.Error()), nil
+	}
+
+	return c.publishLocked(now, c.setProfileLocked(p, at), ""), nil
+}
+
+func readTrace(r TraceReader, raw []byte, stacks map[int64][]Frame) (ws []Wakeup, err error) {
+	defer func() {
+		if p := recover(); p != nil {
+			ws, err = nil, fmt.Errorf("panic: %v", p)
+		}
+	}()
+
+	return r.ReadTrace(bytes.NewReader(raw), stacks)
+}
+
+func (c *collector) traceStacks(ctx context.Context) map[int64][]Frame {
+	fd, err := c.fullFlight(ctx, true)
+	if err != nil || len(fd.gs) == 0 {
+		return nil
+	}
+
+	stacks := make(map[int64][]Frame, len(fd.gs))
+
+	for _, g := range fd.gs {
+		stacks[g.ID] = traceFrames(g.Frames)
+	}
+
+	return stacks
+}
+
+func (c *collector) traceFailed(err error) (Snapshot, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	c.traceTry = attempt{at: c.now(), err: err}
+
+	return c.last, err
 }
 
 func (c *collector) snapshot(ctx context.Context) Snapshot {
@@ -197,20 +369,21 @@ func (c *collector) snapshot(ctx context.Context) Snapshot {
 
 	switch {
 	case !have:
-		return c.first(ctx)
+		return c.refresh(ctx, true)
 	case stale:
-		s, _ = shared(ctx, c, "refresh", func(ctx context.Context) (Snapshot, error) {
-			return c.sample(ctx, false), nil
-		})
+		return c.refresh(ctx, false)
 	}
 
 	return s
 }
 
-func (c *collector) first(ctx context.Context) Snapshot {
-	s, _ := shared(ctx, c, "first", func(ctx context.Context) (Snapshot, error) {
-		return c.sample(ctx, true), nil
+func (c *collector) refresh(ctx context.Context, withFull bool) Snapshot {
+	s, err := shared(ctx, c, "refresh", fetchTimeout, func(ctx context.Context) (Snapshot, error) {
+		return c.sample(ctx, withFull), nil
 	})
+	if err != nil {
+		return c.lastSnapshot()
+	}
 
 	return s
 }
@@ -222,38 +395,44 @@ func (c *collector) hasProfile() bool {
 	return c.haveProfile
 }
 
-func shared[T any](ctx context.Context, c *collector, key string, fn func(context.Context) (T, error)) (T, error) {
+func shared[T any](ctx context.Context, c *collector, key string, timeout time.Duration, fn func(context.Context) (T, error)) (T, error) {
 	c.fmu.Lock()
 
-	if f, ok := c.flights[key]; ok {
-		c.fmu.Unlock()
-		<-f.done
+	f, ok := c.flights[key]
+	if !ok {
+		if c.flights == nil {
+			c.flights = map[string]*flight{}
+		}
 
+		f = &flight{done: make(chan struct{})}
+		c.flights[key] = f
+
+		run, cancel := context.WithTimeout(context.WithoutCancel(ctx), timeout)
+
+		go func() {
+			defer cancel()
+
+			f.val, f.err = fn(run)
+
+			c.fmu.Lock()
+			delete(c.flights, key)
+			c.fmu.Unlock()
+			close(f.done)
+		}()
+	}
+
+	c.fmu.Unlock()
+
+	select {
+	case <-f.done:
 		v, _ := f.val.(T)
 
 		return v, f.err
+	case <-ctx.Done():
+		var zero T
+
+		return zero, ctx.Err()
 	}
-
-	if c.flights == nil {
-		c.flights = map[string]*flight{}
-	}
-
-	f := &flight{done: make(chan struct{})}
-	c.flights[key] = f
-	c.fmu.Unlock()
-
-	run, cancel := context.WithTimeout(context.WithoutCancel(ctx), fetchTimeout)
-	v, err := fn(run)
-	cancel()
-
-	f.val, f.err = v, err
-
-	c.fmu.Lock()
-	delete(c.flights, key)
-	c.fmu.Unlock()
-	close(f.done)
-
-	return v, err
 }
 
 func (c *collector) subscribe() (<-chan message, func()) {
@@ -342,9 +521,7 @@ func (c *collector) loop() {
 		withFull := !now.Before(c.nextFull)
 		c.mu.Unlock()
 
-		ctx, cancel := context.WithTimeout(context.Background(), fetchTimeout)
-		c.sample(ctx, withFull)
-		cancel()
+		c.refresh(context.Background(), withFull)
 	}
 }
 
@@ -371,17 +548,29 @@ func (c *collector) fetchFull(ctx context.Context) (fullDump, error) {
 
 	gs, err := dump.ParseFull(bytes.NewReader(raw))
 
-	return fullDump{gs: gs, cost: time.Since(start)}, err
+	return fullDump{gs: gs, cost: time.Since(start), cut: len(raw) >= c.fullCap}, err
 }
 
-func (c *collector) applyFullLocked(now time.Time, fd fullDump, recovering bool) {
-	if recovering && c.full.maxID > 0 && maxID(fd.gs) < c.full.maxID {
+func (c *collector) fetchLeaks(ctx context.Context) (dump.Profile, error) {
+	raw, err := c.src.Leaks(ctx)
+	if err != nil {
+		return dump.Profile{}, err
+	}
+
+	return dump.ParseStacks(bytes.NewReader(raw))
+}
+
+func (c *collector) applyFullLocked(now time.Time, fd fullDump) {
+	if c.restart && maxID(fd.gs) < c.full.maxID {
 		c.hist = history{window: historyWindow}
 		c.leaks = leakState{}
 		c.full = fullState{}
+		c.trace = traceState{}
 	}
 
+	c.restart = false
 	c.full.update(now, fd.gs)
+	c.full.cut = fd.cut
 	c.fullEvery = nextInterval(fd.cost, fullFactor, fullMin, fullMax)
 	c.nextFull = now.Add(c.fullEvery)
 }
@@ -398,10 +587,11 @@ func maxID(gs []dump.Goroutine) int64 {
 
 func (c *collector) failLocked(now time.Time, err error) Snapshot {
 	c.down = true
+	c.readErr = err.Error()
 	c.last.At = now
 	c.last.Target = c.src.Name()
 	c.last.Interval = c.interval
-	c.last.Error = err.Error()
+	c.last.Error = c.readErr
 
 	if c.last.Groups == nil {
 		c.last.Groups = []Group{}
@@ -429,6 +619,7 @@ func (c *collector) publishLocked(now time.Time, record bool, note string) Snaps
 		fg, ok := c.full.groups[id]
 		if !ok {
 			fg, ok = c.full.bySite[g.WaitSite]
+			ok = ok && fg.calls(g.Entry)
 		}
 
 		if ok {
@@ -445,6 +636,10 @@ func (c *collector) publishLocked(now time.Time, record bool, note string) Snaps
 		c.hist.add(now, counts)
 	}
 
+	if note == "" && c.down {
+		note = c.readErr
+	}
+
 	slices.SortFunc(out, func(a, b Group) int {
 		return cmp.Or(cmp.Compare(b.Count, a.Count), cmp.Compare(a.ID, b.ID))
 	})
@@ -455,10 +650,14 @@ func (c *collector) publishLocked(now time.Time, record bool, note string) Snaps
 		Goroutines: total,
 		Interval:   c.interval,
 		FullAt:     c.full.at,
+		FullCount:  c.full.count,
+		FullCut:    c.full.cut,
 		LeaksAt:    c.leaks.at,
+		TraceAt:    c.trace.at,
+		TraceFor:   c.trace.d,
 		Error:      note,
 		Groups:     out,
-		Edges:      []Edge{},
+		Edges:      c.edgesLocked(groups),
 	}
 
 	c.broadcastLocked(c.last)

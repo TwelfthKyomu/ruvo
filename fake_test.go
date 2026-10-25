@@ -3,6 +3,7 @@ package ruvo
 import (
 	"context"
 	"fmt"
+	"io"
 	"os"
 	"sync"
 	"testing"
@@ -17,6 +18,9 @@ type fakeSource struct {
 	err      error
 	err2     error
 	leaksErr error
+	trace    []byte
+	traceErr error
+	traceD   time.Duration
 	delay    time.Duration
 	calls    map[string]int
 }
@@ -101,8 +105,47 @@ func (f *fakeSource) Leaks(ctx context.Context) ([]byte, error) {
 	return f.leaks, nil
 }
 
+func (f *fakeSource) Trace(ctx context.Context, d time.Duration) ([]byte, error) {
+	time.Sleep(f.enter("trace"))
+
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	f.traceD = d
+
+	if f.traceErr != nil {
+		return nil, f.traceErr
+	}
+
+	return f.trace, nil
+}
+
 func (f *fakeSource) Name() string {
 	return "fake"
+}
+
+type fakeReader struct {
+	wakeups []Wakeup
+	err     error
+	crash   any
+	raw     []byte
+	stacks  map[int64][]Frame
+}
+
+func (r *fakeReader) ReadTrace(trace io.Reader, stacks map[int64][]Frame) ([]Wakeup, error) {
+	raw, err := io.ReadAll(trace)
+	if err != nil {
+		return nil, err
+	}
+
+	r.raw = raw
+	r.stacks = stacks
+
+	if r.crash != nil {
+		panic(r.crash)
+	}
+
+	return r.wakeups, r.err
 }
 
 type clock struct {
@@ -135,4 +178,14 @@ func newTestCollector(t *testing.T, src *fakeSource) (*collector, *clock) {
 	t.Cleanup(c.close)
 
 	return c, clk
+}
+
+type readerFunc struct {
+	fn func()
+}
+
+func (r *readerFunc) ReadTrace(trace io.Reader, stacks map[int64][]Frame) ([]Wakeup, error) {
+	r.fn()
+
+	return nil, nil
 }

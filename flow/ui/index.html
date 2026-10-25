@@ -1,0 +1,1346 @@
+<!doctype html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>ruvo · flow</title>
+    <style>
+        :root {
+            --bg: #f7f7f5;
+            --panel: #ffffff;
+            --text: #1d1d1f;
+            --muted: #6e6e73;
+            --line: #e3e3e0;
+            --hover: #f1f1ee;
+            --accent: #2f5bd3;
+            --bad: #c62828;
+            --good: #2e7d32;
+            --warn-bg: #fdecea;
+            --warn-text: #8a1c1c;
+            --canvas: #f3f3f0;
+            --node: #ffffff;
+            --node-line: #d2d2cc;
+            --edge: #8b92a5;
+            --spawn: #a6a6ae;
+            --jam: #d32f2f;
+            --on-jam: #ffffff;
+            --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+        }
+
+        @media (prefers-color-scheme: dark) {
+            :root {
+                --bg: #141416;
+                --panel: #1c1c1f;
+                --text: #ececef;
+                --muted: #98989f;
+                --line: #2c2c31;
+                --hover: #24242a;
+                --accent: #7c9cff;
+                --bad: #ff6b6b;
+                --good: #6fcf73;
+                --warn-bg: #3a1d1d;
+                --warn-text: #ffb4b4;
+                --canvas: #161618;
+                --node: #232327;
+                --node-line: #3a3a41;
+                --edge: #6f768b;
+                --spawn: #5a5a63;
+                --jam: #ff6b6b;
+                --on-jam: #1c1c1f;
+            }
+        }
+
+        * {
+            box-sizing: border-box;
+        }
+
+        body {
+            margin: 0;
+            background: var(--bg);
+            color: var(--text);
+            font: 14px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+        }
+
+        header {
+            display: flex;
+            flex-wrap: wrap;
+            align-items: center;
+            gap: 8px 20px;
+            padding: 14px 20px;
+            background: var(--panel);
+            border-bottom: 1px solid var(--line);
+        }
+
+        .brand {
+            font-weight: 700;
+            font-size: 18px;
+            letter-spacing: -0.02em;
+        }
+
+        .target {
+            min-width: 0;
+            font-family: var(--mono);
+            color: var(--muted);
+            overflow-wrap: anywhere;
+        }
+
+        nav {
+            display: flex;
+            gap: 14px;
+        }
+
+        nav a {
+            color: var(--accent);
+            text-decoration: none;
+        }
+
+        nav a:hover {
+            text-decoration: underline;
+        }
+
+        nav a[aria-current] {
+            color: var(--text);
+            font-weight: 600;
+        }
+
+        .stats {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 6px 18px;
+            margin-left: auto;
+            align-items: center;
+        }
+
+        .stat b {
+            font-variant-numeric: tabular-nums;
+        }
+
+        .check {
+            display: inline-flex;
+            align-items: center;
+            gap: 6px;
+            cursor: pointer;
+            user-select: none;
+        }
+
+        .check input {
+            margin: 0;
+            accent-color: var(--accent);
+        }
+
+        button {
+            font: inherit;
+            padding: 4px 10px;
+            border: 1px solid var(--line);
+            border-radius: 6px;
+            background: var(--panel);
+            color: var(--accent);
+            cursor: pointer;
+        }
+
+        button:hover {
+            background: var(--hover);
+        }
+
+        button:disabled {
+            color: var(--muted);
+            cursor: default;
+        }
+
+        .note {
+            color: var(--bad);
+            font-size: 13px;
+            overflow-wrap: anywhere;
+        }
+
+        .banner {
+            display: none;
+            margin: 12px 20px 0;
+            padding: 10px 14px;
+            border-radius: 8px;
+            background: var(--warn-bg);
+            color: var(--warn-text);
+            overflow-wrap: anywhere;
+        }
+
+        .banner.on {
+            display: block;
+        }
+
+        main {
+            padding: 16px 20px 40px;
+        }
+
+        .hint {
+            margin: 0 0 12px;
+            color: var(--muted);
+        }
+
+        .layout {
+            display: grid;
+            grid-template-columns: minmax(0, 1fr);
+            gap: 16px;
+            align-items: start;
+        }
+
+        .wrap {
+            overflow: hidden;
+            background: var(--canvas);
+            border: 1px solid var(--line);
+            border-radius: 10px;
+        }
+
+        .board {
+            overflow: auto;
+            max-height: calc(100vh - 150px);
+        }
+
+        .empty {
+            padding: 40px;
+            text-align: center;
+            color: var(--muted);
+        }
+
+        .more {
+            padding: 9px 14px;
+            border-top: 1px solid var(--line);
+            background: var(--panel);
+            font-size: 13px;
+        }
+
+        .more a {
+            color: var(--accent);
+            text-decoration: none;
+        }
+
+        .more a:hover {
+            text-decoration: underline;
+        }
+
+        .side {
+            min-width: 0;
+            padding: 14px 16px 16px;
+            background: var(--panel);
+            border: 1px solid var(--line);
+            border-radius: 10px;
+        }
+
+        .side-head {
+            display: flex;
+            align-items: flex-start;
+            justify-content: space-between;
+            gap: 10px;
+        }
+
+        .side-title {
+            font-family: var(--mono);
+            font-size: 14px;
+            font-weight: 600;
+            overflow-wrap: anywhere;
+        }
+
+        .close {
+            flex: none;
+            padding: 0 6px;
+            border: 0;
+            background: none;
+            color: var(--muted);
+            font-size: 20px;
+            line-height: 1;
+        }
+
+        .facts {
+            display: grid;
+            grid-template-columns: max-content minmax(0, 1fr);
+            gap: 6px 14px;
+            margin: 12px 0 0;
+            font-size: 13px;
+        }
+
+        .facts dt {
+            color: var(--muted);
+        }
+
+        .facts dd {
+            margin: 0;
+            overflow-wrap: anywhere;
+        }
+
+        .facts .mono {
+            font-family: var(--mono);
+            font-size: 12px;
+        }
+
+        .facts .num {
+            font-variant-numeric: tabular-nums;
+        }
+
+        .side h3 {
+            margin: 18px 0 6px;
+            font-size: 12px;
+            font-weight: 600;
+            color: var(--muted);
+            text-transform: uppercase;
+            letter-spacing: 0.04em;
+        }
+
+        .links {
+            margin: 0;
+            padding: 0;
+            list-style: none;
+            font-size: 13px;
+        }
+
+        .links li {
+            display: flex;
+            justify-content: space-between;
+            align-items: baseline;
+            gap: 12px;
+            padding: 5px 0;
+            border-bottom: 1px solid var(--line);
+        }
+
+        .links li:last-child {
+            border-bottom: 0;
+        }
+
+        .who {
+            min-width: 0;
+            font-family: var(--mono);
+            font-size: 12px;
+            text-align: left;
+            overflow-wrap: anywhere;
+        }
+
+        button.who {
+            padding: 0;
+            border: 0;
+            background: none;
+            color: var(--accent);
+        }
+
+        button.who:hover {
+            background: none;
+            text-decoration: underline;
+        }
+
+        .rate {
+            flex: none;
+            color: var(--muted);
+            font-variant-numeric: tabular-nums;
+            white-space: nowrap;
+        }
+
+        .stack {
+            margin: 0;
+            padding: 0;
+            list-style: none;
+            font-family: var(--mono);
+            font-size: 12px;
+        }
+
+        .stack li {
+            padding: 1px 0;
+            word-break: break-all;
+        }
+
+        .bad {
+            color: var(--bad);
+            font-weight: 600;
+        }
+
+        .good {
+            color: var(--good);
+        }
+
+        .dim {
+            color: var(--muted);
+        }
+
+        #graph {
+            display: block;
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+        }
+
+        .node {
+            cursor: pointer;
+            outline: none;
+        }
+
+        .box {
+            fill: var(--node);
+            stroke: var(--node-line);
+            stroke-width: 1;
+        }
+
+        .node:hover .box {
+            stroke: var(--muted);
+        }
+
+        .node.hot .box {
+            fill: var(--warn-bg);
+            stroke: var(--bad);
+        }
+
+        .node.hot:hover .box {
+            stroke-width: 2;
+        }
+
+        .node.sel .box, .node:focus-visible .box {
+            stroke: var(--accent);
+            stroke-width: 2;
+        }
+
+        .n-site {
+            font-family: var(--mono);
+            font-size: 12px;
+            fill: var(--text);
+        }
+
+        .n-meta {
+            font-size: 12px;
+            fill: var(--muted);
+        }
+
+        .n-count {
+            font-weight: 600;
+            fill: var(--text);
+        }
+
+        .badge rect {
+            fill: var(--node);
+            stroke: var(--node-line);
+        }
+
+        .badge text {
+            font-size: 10.5px;
+            font-weight: 600;
+            fill: var(--muted);
+        }
+
+        .badge.bad rect {
+            fill: var(--warn-bg);
+            stroke: var(--bad);
+        }
+
+        .badge.bad text {
+            fill: var(--warn-text);
+        }
+
+        .badge.alert rect {
+            fill: var(--jam);
+            stroke: var(--jam);
+        }
+
+        .badge.alert text {
+            fill: var(--on-jam);
+        }
+
+        .edge .hit {
+            fill: none;
+            stroke: transparent;
+            stroke-width: 14;
+            pointer-events: stroke;
+        }
+
+        .edge .line {
+            fill: none;
+            stroke: var(--edge);
+            pointer-events: none;
+        }
+
+        .edge.spawn .line {
+            stroke: var(--spawn);
+            stroke-dasharray: 5 4;
+        }
+
+        .edge.jam .line {
+            stroke: var(--jam);
+        }
+
+        .edge.on .line {
+            stroke: var(--accent);
+        }
+
+        .edge.off, .elabel.off {
+            opacity: 0.15;
+        }
+
+        .head-edge {
+            fill: var(--edge);
+        }
+
+        .head-spawn {
+            fill: var(--spawn);
+        }
+
+        .head-jam {
+            fill: var(--jam);
+        }
+
+        .head-on {
+            fill: var(--accent);
+        }
+
+        .elabel {
+            font-size: 11px;
+            fill: var(--muted);
+            paint-order: stroke;
+            stroke: var(--canvas);
+            stroke-width: 4px;
+            stroke-linejoin: round;
+            font-variant-numeric: tabular-nums;
+            pointer-events: none;
+        }
+
+        .elabel.jam {
+            fill: var(--jam);
+            font-weight: 600;
+        }
+
+        .heading {
+            font-size: 12px;
+            font-weight: 600;
+            fill: var(--muted);
+            letter-spacing: 0.04em;
+            text-transform: uppercase;
+        }
+
+        .rule {
+            stroke: var(--line);
+        }
+
+        @media (min-width: 900px) {
+            .layout.open {
+                grid-template-columns: minmax(0, 1fr) 360px;
+            }
+
+            .side {
+                position: sticky;
+                top: 16px;
+                max-height: calc(100vh - 32px);
+                overflow: auto;
+            }
+        }
+
+        @media (max-width: 899.98px) {
+            header {
+                padding: 12px 14px;
+            }
+
+            .banner {
+                margin: 12px 12px 0;
+            }
+
+            main {
+                padding: 12px 12px 32px;
+            }
+
+            .board {
+                max-height: 70vh;
+            }
+        }
+    </style>
+</head>
+<body>
+<header>
+    <span class="brand">ruvo</span>
+    <span class="target" id="target"></span>
+    <nav><a href="../">list</a><a href="./" aria-current="page">flow</a></nav>
+    <div class="stats">
+        <span class="stat"><b id="count">—</b> goroutines</span>
+        <span class="stat dim" id="updated">connecting…</span>
+        <span class="stat"><span id="trace">trace: never</span> <button id="traceBtn" type="button">Record trace (5 s)</button></span>
+        <label class="stat check"><input type="checkbox" id="spawn"> spawn</label>
+        <span class="note" id="note"></span>
+    </div>
+</header>
+<div class="banner" id="banner"></div>
+<main>
+    <p class="hint" id="hint">Arrows show who wakes whom. Press Record trace to capture 5 seconds of the target.</p>
+    <div class="layout" id="layout">
+        <div class="wrap">
+            <div class="board" id="board">
+                <svg id="graph" role="group" aria-label="Goroutine groups and who wakes whom"></svg>
+                <div class="empty" id="empty">Waiting for the first snapshot…</div>
+            </div>
+            <div class="more" id="more" hidden><a href="../" id="moreLink"></a></div>
+        </div>
+        <aside class="side" id="side" hidden>
+            <div class="side-head">
+                <div class="side-title" id="sideTitle"></div>
+                <button class="close" id="close" type="button" aria-label="Close">×</button>
+            </div>
+            <dl class="facts" id="facts"></dl>
+            <h3>Woken by</h3>
+            <ul class="links" id="wokenBy"></ul>
+            <h3>Wakes</h3>
+            <ul class="links" id="wakes"></ul>
+            <h3>Stack</h3>
+            <ul class="stack" id="stack"></ul>
+        </aside>
+    </div>
+</main>
+<script>
+    const $ = (id) => document.getElementById(id);
+    const NS = "http://www.w3.org/2000/svg";
+    const NW = 260;
+    const NH = 64;
+    const STEP_X = NW + 120;
+    const STEP_Y = NH + 32;
+    const CELL = NW + 40;
+    const PAD = 40;
+    const LIMIT = 40;
+    const SANS = '-apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif';
+    const SITE = "12px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace";
+    const META = "12px " + SANS;
+    const BOLD = "600 12px " + SANS;
+    const BADGE = "600 10.5px " + SANS;
+    const LABEL = "11px " + SANS;
+    const HEADS = [[3, 9, 8], [5.5, 12, 11], [Infinity, 15, 14]];
+    const pen = document.createElement("canvas").getContext("2d");
+    const wide = window.matchMedia("(min-width: 900px)");
+    let snap = null;
+    let received = 0;
+    let fresh = 0;
+    let lost = false;
+    let poller = null;
+    let picked = null;
+    let spawns = false;
+    let cols = 0;
+    let lines = [];
+    let drawn = new Set();
+    let resizing = 0;
+
+    function el(tag, cls, text) {
+        const e = document.createElement(tag);
+        if (cls) e.className = cls;
+        if (text !== undefined) e.textContent = text;
+        return e;
+    }
+
+    function sv(tag, attrs, text) {
+        const e = document.createElementNS(NS, tag);
+        for (const k in attrs || {}) e.setAttribute(k, attrs[k]);
+        if (text !== undefined) e.textContent = text;
+        return e;
+    }
+
+    function r(v) {
+        return Math.round(v * 10) / 10;
+    }
+
+    function ago(ms) {
+        const s = Math.max(0, Math.round(ms / 1000));
+        if (s < 60) return s + "s ago";
+        const m = Math.floor(s / 60);
+        if (m < 60) return m + "m ago";
+        return Math.floor(m / 60) + "h " + (m % 60) + "m ago";
+    }
+
+    function since(at) {
+        if (!at || !snap) return null;
+        const t = Date.parse(at);
+        if (isNaN(t)) return null;
+        const base = Date.parse(snap.at);
+        return isNaN(base) ? Date.now() - t : base - t + (Date.now() - received);
+    }
+
+    function seconds(ns) {
+        const s = ns / 1e9;
+        return (Number.isInteger(s) ? s : s.toFixed(1)) + " s";
+    }
+
+    function count(v) {
+        return typeof v === "number" ? v.toLocaleString("en-US") : "—";
+    }
+
+    function num(v) {
+        if (!(v > 0)) return "0";
+        if (v >= 1000) return Math.round(v).toLocaleString("en-US");
+        if (v >= 10) return String(Math.round(v));
+        if (v >= 1) return String(+v.toFixed(1));
+        if (v >= 0.01) return String(+v.toFixed(2));
+        return "<0.01";
+    }
+
+    function approx(v) {
+        const s = num(v);
+        return s[0] === "<" ? s : "≈" + s;
+    }
+
+    function wait(g) {
+        if (!g.inFullDump) return "—";
+        const m = Math.floor(g.maxWait / 6e10);
+        if (m < 1) return "<1m";
+        if (m < 60) return m + "m";
+        return Math.floor(m / 60) + "h " + (m % 60) + "m";
+    }
+
+    function grow(v) {
+        const a = Math.abs(v);
+        return (v > 0 ? "+" : "−") + (a >= 10 ? Math.round(a).toString() : a.toFixed(1));
+    }
+
+    function rate(e) {
+        return snap.traceFor > 0 ? e.count / (snap.traceFor / 1e9) : 0;
+    }
+
+    function waiting(e) {
+        return snap.traceFor > 0 ? (e.wait || 0) / snap.traceFor : 0;
+    }
+
+    function share(e) {
+        if (!(snap.traceFor > 0)) return 0;
+        return Math.min(1, (e.wait || 0) / (snap.traceFor * Math.max(e.waiters || 0, 1)));
+    }
+
+    function handoff(e) {
+        return num(rate(e)) + "/s · " + approx(waiting(e)) + " waiting";
+    }
+
+    function measure(text, font) {
+        if (!pen) return text.length * 7;
+        pen.font = font;
+        return pen.measureText(text).width;
+    }
+
+    function clip(text, font, max) {
+        if (measure(text, font) <= max) return text;
+        let lo = 0;
+        let hi = text.length;
+        while (lo < hi) {
+            const mid = (lo + hi + 1) >> 1;
+            if (measure(text.slice(0, mid) + "…", font) <= max) lo = mid;
+            else hi = mid - 1;
+        }
+        return text.slice(0, lo) + "…";
+    }
+
+    function split(site) {
+        const s = site || "";
+        const i = s.lastIndexOf(" ");
+        const fn = i > 0 ? s.slice(0, i) : s;
+        const b = fn.indexOf("[");
+        const head = b >= 0 ? fn.slice(0, b) : fn;
+        return {fn: fn.slice(head.lastIndexOf("/") + 1), loc: i > 0 ? s.slice(i + 1) : ""};
+    }
+
+    function brief(site) {
+        const p = split(site);
+        return p.loc ? p.fn + " " + p.loc : p.fn;
+    }
+
+    function short(fn) {
+        const m = /^[^.]*\.\(\*([^)]*)\)\.(.+)$/.exec(fn);
+        return m ? m[1] + "." + m[2] : fn;
+    }
+
+    function who(id, m) {
+        const g = m.byId.get(id);
+        return g ? brief(g.waitSite) : id;
+    }
+
+    function model() {
+        const groups = snap.groups || [];
+        const byId = new Map();
+        const stats = new Map();
+        for (const g of groups) {
+            byId.set(g.id, g);
+            stats.set(g.id, {wait: 0, network: 0, timer: 0, self: null, ins: [], outs: []});
+        }
+        const edges = [];
+        const ranked = [];
+        for (const e of snap.edges || []) {
+            const to = stats.get(e.to);
+            const cause = e.from === "network" || e.from === "timer";
+            if (!to || (!cause && !byId.has(e.from))) continue;
+            if (e.kind === "unblock") {
+                ranked.push(e);
+                to.wait += e.wait || 0;
+                to.ins.push(e);
+                if (cause) to[e.from] += e.wait || 0;
+                else stats.get(e.from).outs.push(e);
+                if (e.from === e.to) to.self = e;
+            }
+            if (!cause && e.from !== e.to && (e.kind === "unblock" || e.kind === "spawn")) edges.push(e);
+        }
+        let jam = null;
+        if (snap.traceFor > 0) {
+            for (const std of [false, true]) {
+                let most = 0;
+                for (const [id, s] of stats) {
+                    const v = s.wait / snap.traceFor;
+                    if (!!byId.get(id).std === std && v >= 1 && v > most) {
+                        most = v;
+                        jam = id;
+                    }
+                }
+                if (jam) break;
+            }
+        }
+        const chosen = [];
+        const seen = new Set();
+        const add = (id) => {
+            if (seen.has(id) || chosen.length >= LIMIT) return;
+            seen.add(id);
+            chosen.push(id);
+        };
+        if (jam) {
+            let top = null;
+            for (const e of edges) {
+                if (e.kind === "unblock" && e.to === jam && (!top || (e.wait || 0) > (top.wait || 0))) top = e;
+            }
+            add(jam);
+            if (top) add(top.from);
+        }
+        ranked.sort((a, b) => (b.wait || 0) - (a.wait || 0));
+        for (const e of ranked) {
+            if (chosen.length >= LIMIT) break;
+            const ends = [e.from, e.to].filter((id, i, a) => byId.has(id) && !seen.has(id) && a.indexOf(id) === i);
+            if (chosen.length + ends.length <= LIMIT) ends.forEach(add);
+        }
+        const bySize = (a, b) => (b.count || 0) - (a.count || 0) || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0);
+        const rest = groups.slice().sort(bySize);
+        const bad = rest.filter((g) => g.leaked > 0 || g.growthPerMin > 0);
+        bad.sort((a, b) => (b.leaked || 0) - (a.leaked || 0) || (b.growthPerMin || 0) - (a.growthPerMin || 0) || bySize(a, b));
+        for (const g of bad) add(g.id);
+        for (const g of rest) {
+            if (chosen.length >= LIMIT) break;
+            add(g.id);
+        }
+        return {byId, stats, edges, jam, chosen};
+    }
+
+    function layout(m) {
+        const ids = m.chosen;
+        const inside = new Set(ids);
+        const shown = m.edges.filter((e) => inside.has(e.from) && inside.has(e.to) && (e.kind === "unblock" || spawns));
+        const out = new Map(ids.map((id) => [id, new Map()]));
+        const linked = new Set();
+        for (const e of shown) {
+            const o = out.get(e.from);
+            o.set(e.to, (o.get(e.to) || 0) + (e.kind === "unblock" ? e.wait || 0 : 0));
+            linked.add(e.from);
+            linked.add(e.to);
+        }
+        const load = new Map(ids.map((id) => [id, [...out.get(id).values()].reduce((a, b) => a + b, 0)]));
+        const size = (id) => m.byId.get(id).count || 0;
+        const deg = (id) => out.get(id).size;
+        const rank = (a, b) => load.get(b) - load.get(a) || deg(b) - deg(a) || size(b) - size(a) || (a < b ? -1 : a > b ? 1 : 0);
+        const nodes = ids.filter((id) => linked.has(id)).sort(rank);
+        const dag = new Map(nodes.map((id) => [id, new Set()]));
+        const mark = new Map();
+        const visit = (u) => {
+            mark.set(u, 1);
+            const o = out.get(u);
+            for (const v of [...o.keys()].sort((a, b) => o.get(b) - o.get(a) || rank(a, b))) {
+                if (mark.get(v) === 1) {
+                    dag.get(v).add(u);
+                    continue;
+                }
+                dag.get(u).add(v);
+                if (!mark.has(v)) visit(v);
+            }
+            mark.set(u, 2);
+        };
+        for (const id of nodes) if (!mark.has(id)) visit(id);
+        const preds = new Map(nodes.map((id) => [id, []]));
+        const indeg = new Map(nodes.map((id) => [id, 0]));
+        for (const [u, vs] of dag) {
+            for (const v of vs) {
+                preds.get(v).push(u);
+                indeg.set(v, indeg.get(v) + 1);
+            }
+        }
+        const layer = new Map(nodes.map((id) => [id, 0]));
+        const queue = nodes.filter((id) => indeg.get(id) === 0);
+        for (let i = 0; i < queue.length; i++) {
+            const u = queue[i];
+            for (const v of dag.get(u)) {
+                layer.set(v, Math.max(layer.get(v), layer.get(u) + 1));
+                indeg.set(v, indeg.get(v) - 1);
+                if (indeg.get(v) === 0) queue.push(v);
+            }
+        }
+        const layers = [];
+        for (const id of nodes) {
+            const l = layer.get(id);
+            (layers[l] = layers[l] || []).push(id);
+        }
+        const bySize = (a, b) => size(b) - size(a) || (a < b ? -1 : a > b ? 1 : 0);
+        for (const l of layers) l.sort(bySize);
+        const tall = layers.reduce((n, l) => Math.max(n, l.length), 0);
+        const pos = new Map();
+        const place = (l) => {
+            const off = (tall - l.length) / 2;
+            l.forEach((id, i) => pos.set(id, off + i));
+        };
+        const sweep = (l, near) => {
+            const bc = new Map();
+            for (const id of l) {
+                let s = 0;
+                let n = 0;
+                for (const v of near(id)) {
+                    s += pos.get(v);
+                    n++;
+                }
+                bc.set(id, n ? s / n : pos.get(id));
+            }
+            l.sort((a, b) => bc.get(a) - bc.get(b));
+            place(l);
+        };
+        layers.forEach(place);
+        for (let k = 0; k < 4; k++) {
+            for (let i = 1; i < layers.length; i++) sweep(layers[i], (id) => preds.get(id));
+            for (let i = layers.length - 2; i >= 0; i--) sweep(layers[i], (id) => dag.get(id));
+        }
+        const at = new Map();
+        for (const id of nodes) at.set(id, {x: PAD + layer.get(id) * STEP_X, y: PAD + pos.get(id) * STEP_Y, layer: layer.get(id)});
+        const loose = ids.filter((id) => !linked.has(id)).sort(bySize);
+        const bottom = PAD + (tall - 1) * STEP_Y + NH;
+        let width = nodes.length ? PAD + (layers.length - 1) * STEP_X + NW + 48 : 0;
+        let height = bottom + 40;
+        let top = 0;
+        if (loose.length) {
+            top = nodes.length ? bottom + 48 : 12;
+            const c = Math.max(1, Math.min(cols, loose.length));
+            loose.forEach((id, i) => at.set(id, {x: PAD + (i % c) * CELL, y: top + 28 + Math.floor(i / c) * STEP_Y, layer: -1}));
+            width = Math.max(width, PAD + (c - 1) * CELL + NW + PAD);
+            height = top + 28 + (Math.ceil(loose.length / c) - 1) * STEP_Y + NH + 32;
+        }
+        return {at, shown, width, height, top, layered: nodes.length, loose: loose.length};
+    }
+
+    function columns() {
+        let w = $("layout").clientWidth;
+        if (wide.matches) w -= 376;
+        return Math.max(1, Math.floor((w - PAD) / CELL));
+    }
+
+    function head(cls, size) {
+        return "url(#h-" + cls + "-" + size + ")";
+    }
+
+    function defs() {
+        const d = sv("defs");
+        for (const cls of ["edge", "spawn", "jam", "on"]) {
+            HEADS.forEach((h, i) => {
+                const mk = sv("marker", {
+                    id: "h-" + cls + "-" + i,
+                    markerUnits: "userSpaceOnUse",
+                    markerWidth: h[1],
+                    markerHeight: h[2],
+                    viewBox: "0 0 " + h[1] + " " + h[2],
+                    refX: r(h[1] * 0.4),
+                    refY: h[2] / 2,
+                    orient: "auto",
+                });
+                mk.append(sv("path", {class: "head-" + cls, d: "M0 0L" + h[1] + " " + h[2] / 2 + "L0 " + h[2] + "z"}));
+                d.append(mk);
+            });
+        }
+        return d;
+    }
+
+    function geometry(a, b, lift, cut) {
+        const x1 = a.x + NW;
+        const y1 = a.y + NH / 2 + lift;
+        const x2 = b.x - cut;
+        const y2 = b.y + NH / 2 + lift;
+        let c1x = x1 + 80;
+        let c1y = y1 + 64;
+        let c2x = x2 - 80;
+        let c2y = y2 + 64;
+        if (b.layer > a.layer) {
+            const k = Math.max(40, (x2 - x1) / 2);
+            c1x = x1 + k;
+            c1y = y1;
+            c2x = x2 - k;
+            c2y = y2;
+        }
+        return {
+            d: "M" + r(x1) + " " + r(y1) + "C" + r(c1x) + " " + r(c1y) + " " + r(c2x) + " " + r(c2y) + " " + r(x2) + " " + r(y2),
+            mx: (x1 + 3 * c1x + 3 * c2x + x2) / 8,
+            my: (y1 + 3 * c1y + 3 * c2y + y2) / 8,
+        };
+    }
+
+    function drawEdges(root, labels, m, lay) {
+        const pairs = new Set();
+        const unblock = lay.shown.filter((e) => e.kind === "unblock");
+        for (const e of unblock) pairs.add(e.from + " " + e.to);
+        const heavy = new Set(unblock.slice().sort((a, b) => (b.wait || 0) - (a.wait || 0)).slice(0, 8));
+        let red = null;
+        for (const e of unblock) {
+            if (e.to === m.jam && (!red || (e.wait || 0) > (red.wait || 0))) red = e;
+        }
+        const weight = (e) => e === red ? 2 : e.kind === "spawn" ? -1 : share(e);
+        const spots = [];
+        for (const e of lay.shown.slice().sort((a, b) => weight(a) - weight(b))) {
+            const spawn = e.kind === "spawn";
+            const w = spawn ? 1.5 : 1.5 + 6 * share(e);
+            const size = HEADS.findIndex((h) => w <= h[0]);
+            const lift = spawn && pairs.has(e.from + " " + e.to) ? 12 : 0;
+            const g = geometry(lay.at.get(e.from), lay.at.get(e.to), lift, HEADS[size][1] * 0.6);
+            const cls = e === red ? "jam" : spawn ? "spawn" : "edge";
+            const box = sv("g", {class: "edge " + cls});
+            const text = who(e.from, m) + " → " + who(e.to, m) + "\n";
+            box.append(sv("title", {}, text + (spawn ? "started " + e.count + (e.count === 1 ? " goroutine" : " goroutines") : "wakes " + handoff(e))));
+            box.append(sv("path", {class: "hit", d: g.d}));
+            const line = sv("path", {class: "line", d: g.d, "stroke-width": r(w), "marker-end": head(cls, size)});
+            box.append(line);
+            root.append(box);
+            const rec = {e, box, line, label: null, cls, size};
+            lines.push(rec);
+            if (heavy.has(e) && snap.traceFor > 0) spots.push({rec, x: g.mx, y: g.my});
+        }
+        const taken = [];
+        for (const s of spots.sort((a, b) => (b.rec.e.wait || 0) - (a.rec.e.wait || 0))) {
+            const text = handoff(s.rec.e);
+            const half = measure(text, LABEL) / 2 + 3;
+            let y = s.y;
+            for (const dy of [0, -15, 15, -30, 30]) {
+                y = s.y + dy;
+                if (!taken.some((t) => Math.abs(t.x - s.x) < t.half + half && Math.abs(t.y - y) < 14)) break;
+            }
+            taken.push({x: s.x, y, half});
+            s.rec.label = sv("text", {
+                class: "elabel" + (s.rec.e === red ? " jam" : ""),
+                x: r(s.x),
+                y: r(y),
+                dy: "0.35em",
+                "text-anchor": "middle",
+            }, text);
+            labels.append(s.rec.label);
+        }
+    }
+
+    function badges(n, g, s, m) {
+        const list = [];
+        if (g.id === m.jam) list.push(["jam", "alert"]);
+        if (g.leaked > 0) list.push(["leaked " + g.leaked, "bad"]);
+        if (g.growthPerMin > 0) list.push([grow(g.growthPerMin) + "/min", "bad"]);
+        if (s.wait > 0) {
+            for (const c of ["network", "timer"]) {
+                const f = s[c] / s.wait;
+                if (f >= 0.2) list.push([c + " " + Math.round(f * 100) + "%", ""]);
+            }
+        }
+        if (s.self) list.push(["wakes itself " + num(rate(s.self)) + "/s", ""]);
+        let x = 10;
+        for (const [text, cls] of list) {
+            const w = measure(text, BADGE) + 14;
+            if (x > 10 && x + w > NW - 8) break;
+            const b = sv("g", {class: "badge " + cls, transform: "translate(" + r(x) + "," + (NH - 8) + ")"});
+            b.append(sv("rect", {width: r(w), height: 16, rx: 8}));
+            b.append(sv("text", {x: r(w / 2), y: 11.5, "text-anchor": "middle"}, text));
+            n.append(b);
+            x += w + 5;
+        }
+        return list.map((b) => b[0]);
+    }
+
+    function drawNode(root, g, p, m) {
+        const hot = g.leaked > 0 || g.growthPerMin > 0;
+        const n = sv("g", {
+            class: "node" + (hot ? " hot" : "") + (g.id === picked ? " sel" : ""),
+            transform: "translate(" + r(p.x) + "," + r(p.y) + ")",
+            tabindex: "0",
+            role: "button",
+            "data-id": g.id,
+            "aria-label": brief(g.waitSite) + ", " + count(g.count) + " goroutines",
+        });
+        const tip = sv("title");
+        n.append(tip);
+        n.append(sv("rect", {class: "box", width: NW, height: NH, rx: 8}));
+        const max = NW - 24;
+        const site = split(g.waitSite);
+        n.append(sv("text", {class: "n-site", x: 12, y: 25}, clip(short(site.fn) || g.id, SITE, max)));
+        const meta = sv("text", {class: "n-meta", x: 12, y: 46});
+        const lead = "×" + count(g.count);
+        const room = max - measure(lead, BOLD);
+        const loc = site.loc ? clip(site.loc, META, Math.max(room - measure(" · ", META), 40)) + " · " : "";
+        if (loc) meta.append(sv("tspan", {}, loc));
+        meta.append(sv("tspan", {class: "n-count"}, lead));
+        const rest = [g.state, g.inFullDump ? "waiting " + wait(g) : ""].filter(Boolean).join(" · ");
+        if (rest) meta.append(sv("tspan", {}, clip(" · " + rest, META, room - measure(loc, META))));
+        n.append(meta);
+        const marks = badges(n, g, m.stats.get(g.id), m);
+        tip.textContent = [
+            g.waitSite,
+            g.entry ? "started with " + g.entry : "",
+            lead + (g.state ? " · " + g.state : "") + (g.inFullDump ? " · waiting " + wait(g) : ""),
+            marks.join(" · "),
+        ].filter(Boolean).join("\n");
+        n.addEventListener("click", (ev) => {
+            ev.stopPropagation();
+            toggle(g.id);
+        });
+        n.addEventListener("keydown", (ev) => {
+            if (ev.key !== "Enter" && ev.key !== " ") return;
+            ev.preventDefault();
+            if (!ev.repeat) toggle(g.id);
+        });
+        n.addEventListener("mouseenter", () => focus(g.id));
+        n.addEventListener("mouseleave", () => focus(picked));
+        root.append(n);
+    }
+
+    function focus(id) {
+        const on = id && drawn.has(id) ? id : null;
+        for (const l of lines) {
+            const hit = on !== null && (l.e.from === on || l.e.to === on);
+            l.box.classList.toggle("on", hit);
+            l.box.classList.toggle("off", on !== null && !hit);
+            l.line.setAttribute("marker-end", head(hit ? "on" : l.cls, l.size));
+            if (l.label) l.label.classList.toggle("off", on !== null && !hit);
+        }
+    }
+
+    function nodeEl(id) {
+        return $("graph").querySelector('[data-id="' + CSS.escape(id) + '"]');
+    }
+
+    function draw(m) {
+        const svg = $("graph");
+        const active = svg.contains(document.activeElement) ? document.activeElement.getAttribute("data-id") : null;
+        svg.replaceChildren();
+        lines = [];
+        drawn = new Set();
+        $("empty").hidden = !!m;
+        $("empty").textContent = snap ? "No goroutine groups yet." : "Waiting for the first snapshot…";
+        svg.style.display = m ? "block" : "none";
+        $("more").hidden = true;
+        if (!m) return;
+        cols = columns();
+        const lay = layout(m);
+        svg.setAttribute("width", lay.width);
+        svg.setAttribute("height", lay.height);
+        svg.setAttribute("viewBox", "0 0 " + lay.width + " " + lay.height);
+        svg.append(defs());
+        if (lay.loose) {
+            if (lay.layered) svg.append(sv("line", {class: "rule", x1: PAD, x2: lay.width - PAD, y1: lay.top - 14, y2: lay.top - 14}));
+            svg.append(sv("text", {class: "heading", x: PAD, y: lay.top + 12}, "No handoffs seen"));
+        }
+        const edges = sv("g");
+        const labels = sv("g");
+        const nodes = sv("g");
+        svg.append(edges, labels, nodes);
+        drawEdges(edges, labels, m, lay);
+        for (const id of m.chosen) {
+            drawNode(nodes, m.byId.get(id), lay.at.get(id), m);
+            drawn.add(id);
+        }
+        const extra = (snap.groups || []).length - m.chosen.length;
+        if (extra > 0) {
+            $("more").hidden = false;
+            $("moreLink").textContent = "+" + extra + (extra === 1 ? " more group" : " more groups") + " in the list";
+        }
+        focus(picked);
+        if (active) {
+            const n = nodeEl(active);
+            if (n) n.focus({preventScroll: true});
+        }
+    }
+
+    function facts(g) {
+        const dl = $("facts");
+        dl.replaceChildren();
+        const gr = g.growthPerMin ? [grow(g.growthPerMin), g.growthPerMin > 0 ? "num bad" : "num good"] : ["—", "dim"];
+        const rows = [
+            ["Where they wait", g.waitSite || "—", "mono"],
+            ["Started with", g.entry || "—", g.entry ? "mono" : "dim"],
+            ["Created by", g.createdBy || "—", g.createdBy ? "mono" : "dim"],
+            ["Goroutines", String(g.count), "num"],
+            ["State", g.state || "—", g.state ? "" : "dim"],
+            ["Waiting", wait(g), g.inFullDump ? "num" : "dim"],
+            ["Growth/min", gr[0], gr[1]],
+            ["Leaked", g.leaked ? String(g.leaked) : "—", g.leaked ? "num bad" : "dim"],
+        ];
+        for (const [k, v, cls] of rows) dl.append(el("dt", "", k), el("dd", cls, v));
+    }
+
+    function links(ul, edges, end, m, self) {
+        ul.replaceChildren();
+        if (!snap.traceAt) {
+            ul.append(el("li", "dim", "No trace yet"));
+            return;
+        }
+        if (!edges.length) {
+            ul.append(el("li", "dim", "None seen"));
+            return;
+        }
+        const sorted = edges.slice().sort((a, b) => (b.wait || 0) - (a.wait || 0));
+        for (const e of sorted.slice(0, 30)) {
+            const id = e[end];
+            const g = m.byId.get(id);
+            const li = el("li");
+            if (id === self) li.append(el("span", "who dim", "itself"));
+            else if (g) {
+                const b = el("button", "who", brief(g.waitSite));
+                b.type = "button";
+                b.title = g.waitSite;
+                b.onclick = () => {
+                    picked = id;
+                    render();
+                    const n = wide.matches ? nodeEl(id) : null;
+                    if (n) n.scrollIntoView({block: "nearest", inline: "nearest"});
+                };
+                li.append(b);
+            } else li.append(el("span", "who", id));
+            li.append(el("span", "rate", handoff(e)));
+            ul.append(li);
+        }
+        if (sorted.length > 30) ul.append(el("li", "dim", "+" + (sorted.length - 30) + " more"));
+    }
+
+    function panel(m) {
+        const g = picked && m ? m.byId.get(picked) : null;
+        $("side").hidden = !g;
+        $("layout").classList.toggle("open", !!g);
+        if (!g) return;
+        const s = m.stats.get(g.id);
+        $("sideTitle").textContent = split(g.waitSite).fn || g.id;
+        facts(g);
+        links($("wokenBy"), s.ins, "from", m, g.id);
+        links($("wakes"), s.outs, "to", m, g.id);
+        const ul = $("stack");
+        ul.replaceChildren();
+        for (const f of g.stack || []) ul.append(el("li", "", f));
+    }
+
+    function banner() {
+        if (lost) return "Lost connection to ruvo — retrying…";
+        if (!snap) return "";
+        if (snap.error) return "Cannot read the target: " + snap.error;
+        const quiet = Date.now() - fresh;
+        if (quiet > Math.max(3 * snap.interval / 1e6, 15000)) return "No new data for " + ago(quiet).replace(" ago", "") + ".";
+        return "";
+    }
+
+    function header() {
+        const text = banner();
+        const b = $("banner");
+        b.textContent = text;
+        b.classList.toggle("on", text !== "");
+        $("hint").hidden = !!(snap && snap.traceAt);
+        if (!snap) return;
+        $("target").textContent = snap.target || "";
+        $("count").textContent = count(snap.goroutines);
+        $("updated").textContent = "updated " + ago(Date.now() - fresh);
+        const t = since(snap.traceAt);
+        $("trace").textContent = "trace: " + (t === null ? "never" : ago(t) + (snap.traceFor > 0 ? " · " + seconds(snap.traceFor) : ""));
+        document.title = "ruvo · flow · " + (snap.target || "");
+    }
+
+    function render() {
+        header();
+        const m = snap && (snap.groups || []).length ? model() : null;
+        if (picked && (!m || !m.byId.has(picked))) picked = null;
+        draw(m);
+        panel(m);
+    }
+
+    function toggle(id) {
+        picked = picked === id ? null : id;
+        render();
+        if (picked && !wide.matches) $("side").scrollIntoView({block: "start", behavior: "smooth"});
+    }
+
+    function show(s) {
+        if (snap && Date.parse(s.at) < Date.parse(snap.at)) return;
+        if (!snap || s.at !== snap.at) fresh = Date.now();
+        snap = s;
+        received = Date.now();
+        lost = false;
+        render();
+    }
+
+    function disconnected() {
+        lost = true;
+        header();
+    }
+
+    async function poll() {
+        try {
+            const r = await fetch("api/snapshot");
+            if (r.ok) show(await r.json());
+            else disconnected();
+        } catch (e) {
+            disconnected();
+        }
+    }
+
+    function connect() {
+        const es = new EventSource("api/events");
+        es.addEventListener("snapshot", (e) => {
+            if (poller) {
+                clearInterval(poller);
+                poller = null;
+            }
+            show(JSON.parse(e.data));
+        });
+        es.onerror = () => {
+            disconnected();
+            if (!poller) poller = setInterval(poll, 5000);
+        };
+    }
+
+    async function record() {
+        const btn = $("traceBtn");
+        btn.disabled = true;
+        btn.textContent = "Recording 5 s…";
+        $("note").textContent = "";
+        try {
+            const r = await fetch("api/trace?seconds=5", {method: "POST"});
+            if (r.ok) show(await r.json());
+            else $("note").textContent = (await r.text()).trim() || "HTTP " + r.status;
+        } catch (e) {
+            $("note").textContent = String(e);
+        }
+        btn.disabled = false;
+        btn.textContent = "Record trace (5 s)";
+    }
+
+    try {
+        spawns = localStorage.getItem("ruvo.flow.spawn") === "1";
+    } catch (e) {
+        spawns = false;
+    }
+    $("spawn").checked = spawns;
+    $("spawn").onchange = () => {
+        spawns = $("spawn").checked;
+        try {
+            localStorage.setItem("ruvo.flow.spawn", spawns ? "1" : "0");
+        } catch (e) {
+        }
+        render();
+    };
+    $("traceBtn").onclick = record;
+    $("close").onclick = () => {
+        picked = null;
+        render();
+    };
+    $("graph").addEventListener("click", (e) => {
+        if (!picked || e.target.closest(".node")) return;
+        picked = null;
+        render();
+    });
+    document.addEventListener("keydown", (e) => {
+        if (e.key !== "Escape" || !picked) return;
+        picked = null;
+        render();
+    });
+    window.addEventListener("resize", () => {
+        clearTimeout(resizing);
+        resizing = setTimeout(() => {
+            if (snap && columns() !== cols) render();
+        }, 150);
+    });
+    setInterval(header, 1000);
+    render();
+    connect();
+</script>
+</body>
+</html>

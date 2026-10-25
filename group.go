@@ -63,11 +63,26 @@ func groupID(site, entry dump.Frame) string {
 	return fmt.Sprintf("%016x", h.Sum64())
 }
 
-func isDumpWriter(frames []dump.Frame) bool {
+var ownPrefixes = []string{
+	"github.com/TwelfthKyomu/ruvo.(*handler).",
+	"github.com/TwelfthKyomu/ruvo.(*collector).",
+	"github.com/TwelfthKyomu/ruvo.shared[",
+	"github.com/TwelfthKyomu/ruvo/internal/collect.",
+	"runtime/pprof.write",
+	"runtime/trace.(*traceMultiplexer).",
+	"net/http/pprof.Trace",
+}
+
+func isOwn(frames []dump.Frame) bool {
 	for _, f := range frames {
-		if strings.HasPrefix(f.Func, "runtime/pprof.write") || f.Func == "runtime/pprof.(*Profile).WriteTo" ||
-			strings.HasSuffix(f.Func, "ruvo/internal/collect.(*local).full") {
+		if f.Func == "runtime/pprof.(*Profile).WriteTo" {
 			return true
+		}
+
+		for _, p := range ownPrefixes {
+			if strings.HasPrefix(f.Func, p) {
+				return true
+			}
 		}
 	}
 
@@ -79,23 +94,23 @@ func buildGroups(p dump.Profile) (map[string]*Group, int) {
 	total := 0
 
 	for _, r := range p.Records {
-		if isDumpWriter(r.Frames) {
+		if isOwn(r.Frames) {
 			continue
 		}
 
 		total += r.Count
+
+		if len(r.Frames) == 0 {
+			continue
+		}
 
 		site, entry := groupKey(r.Frames)
 		id := groupID(site, entry)
 
 		g := groups[id]
 		if g == nil {
-			g = &Group{ID: id, WaitSite: site.String(), Entry: entry.Func, Stack: stack(r.Frames)}
+			g = &Group{ID: id, WaitSite: site.String(), Entry: entry.Func, Stack: stack(r.Frames), Std: isStd(site.Func)}
 			groups[id] = g
-		}
-
-		if g.WaitSite == "" {
-			g.WaitSite = "(runtime)"
 		}
 
 		g.Count += r.Count

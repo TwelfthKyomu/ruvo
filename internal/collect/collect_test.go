@@ -7,8 +7,10 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"reflect"
+	"runtime/trace"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestLocalGoroutines(t *testing.T) {
@@ -69,6 +71,12 @@ func TestRemoteNoLeakProfile(t *testing.T) {
 
 	if _, err := Remote(srv.URL).Leaks(context.Background()); !errors.Is(err, ErrNoLeakProfile) {
 		t.Fatalf("err %v, want ErrNoLeakProfile", err)
+	}
+}
+
+func TestRemoteClientHasNoTimeout(t *testing.T) {
+	if got := Remote("http://h:6060").(*remote).client.Timeout; got != 0 {
+		t.Fatalf("client timeout %v, want none: the context sets the deadline", got)
 	}
 }
 
@@ -169,5 +177,216 @@ func TestRemoteLimitsBody(t *testing.T) {
 
 	if _, err := r.Goroutines(context.Background(), 2); err == nil || !strings.Contains(err.Error(), "larger than") {
 		t.Fatalf("err %v, want a size-limit error", err)
+	}
+}
+
+func TestLocalTrace(t *testing.T) {
+	b, err := Local().Trace(context.Background(), 100*time.Millisecond)
+	if err != nil || !strings.HasPrefix(string(b), "go 1.") {
+		t.Fatalf("trace: %v, %.40q", err, b)
+	}
+
+	if trace.IsEnabled() {
+		t.Fatal("tracing is still enabled")
+	}
+}
+
+func TestLocalTraceBusy(t *testing.T) {
+	if err := trace.Start(io.Discard); err != nil {
+		t.Fatal(err)
+	}
+
+	t.Cleanup(trace.Stop)
+
+	if _, err := Local().Trace(context.Background(), 50*time.Millisecond); err == nil {
+		t.Fatal("want an error while another trace is running")
+	}
+
+	if !trace.IsEnabled() {
+		t.Fatal("the foreign trace was stopped")
+	}
+}
+
+func TestLocalTraceCanceled(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	time.AfterFunc(50*time.Millisecond, cancel)
+
+	start := time.Now()
+
+	_, err := Local().Trace(ctx, 10*time.Second)
+	if !errors.Is(err, context.Canceled) || time.Since(start) > time.Second {
+		t.Fatalf("err %v after %v, want context.Canceled right after the cancel", err, time.Since(start))
+	}
+
+	if trace.IsEnabled() {
+		t.Fatal("tracing is still enabled")
+	}
+}
+
+func TestLocalTraceCanceledBeforeStart(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	if _, err := Local().Trace(ctx, 10*time.Second); !errors.Is(err, context.Canceled) {
+		t.Fatalf("err %v, want context.Canceled", err)
+	}
+
+	if trace.IsEnabled() {
+		t.Fatal("tracing is still enabled")
+	}
+
+	if err := trace.Start(io.Discard); err != nil {
+		t.Fatal(err)
+	}
+
+	t.Cleanup(trace.Stop)
+
+	if _, err := Local().Trace(ctx, 10*time.Second); !errors.Is(err, context.Canceled) {
+		t.Fatalf("err %v, want context.Canceled without trying to start a trace", err)
+	}
+
+	if !trace.IsEnabled() {
+		t.Fatal("the foreign trace was stopped")
+	}
+}
+
+func TestLocalTraceLimit(t *testing.T) {
+	l := &local{limit: 1024}
+
+	start := time.Now()
+
+	_, err := l.Trace(context.Background(), 10*time.Second)
+	if err == nil || !strings.Contains(err.Error(), "larger than 1024 bytes") || time.Since(start) > 2*time.Second {
+		t.Fatalf("err %v after %v, want a size-limit error well before the duration ends", err, time.Since(start))
+	}
+
+	if trace.IsEnabled() {
+		t.Fatal("tracing is still enabled")
+	}
+}
+
+func TestRemoteTrace(t *testing.T) {
+	var path, seconds string
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		path, seconds = r.URL.Path, r.URL.Query().Get("seconds")
+		io.WriteString(w, "go 1.27 trace")
+	}))
+	defer srv.Close()
+
+	b, err := Remote(srv.URL).Trace(context.Background(), 2*time.Second)
+	if err != nil || string(b) != "go 1.27 trace" {
+		t.Fatalf("body %q, err %v", b, err)
+	}
+
+	if path != "/debug/pprof/trace" || seconds != "2" {
+		t.Fatalf("requested %q, seconds %q", path, seconds)
+	}
+}
+
+func TestRemoteTraceRoundsSecondsUp(t *testing.T) {
+	var seconds string
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		seconds = r.URL.Query().Get("seconds")
+	}))
+	defer srv.Close()
+
+	for _, c := range []struct {
+		d    time.Duration
+		want string
+	}{
+		{100 * time.Millisecond, "1"},
+		{time.Second, "1"},
+		{1500 * time.Millisecond, "2"},
+		{30 * time.Second, "30"},
+	} {
+		if _, err := Remote(srv.URL).Trace(context.Background(), c.d); err != nil || seconds != c.want {
+			t.Fatalf("d %v: seconds %q, err %v, want %q", c.d, seconds, err, c.want)
+		}
+	}
+}
+
+func TestRemoteTraceMissing(t *testing.T) {
+	srv := httptest.NewServer(http.NotFoundHandler())
+	defer srv.Close()
+
+	if _, err := Remote(srv.URL).Trace(context.Background(), time.Second); !errors.Is(err, ErrNoTrace) {
+		t.Fatalf("err %v, want ErrNoTrace", err)
+	}
+}
+
+func TestRemoteTraceLimit(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		io.WriteString(w, strings.Repeat("x", 11))
+	}))
+	defer srv.Close()
+
+	r := Remote(srv.URL).(*remote)
+	r.limit = 10
+
+	if _, err := r.Trace(context.Background(), time.Second); err == nil || !strings.Contains(err.Error(), "larger than 10 bytes") {
+		t.Fatalf("err %v, want a size-limit error", err)
+	}
+}
+
+func TestRemoteErrorShowsBody(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "profile duration exceeds server's WriteTimeout", http.StatusBadRequest)
+	}))
+	defer srv.Close()
+
+	_, err := Remote(srv.URL).Trace(context.Background(), time.Second)
+
+	want := "GET " + srv.URL + "/debug/pprof/trace?seconds=1: 400 Bad Request: profile duration exceeds server's WriteTimeout"
+	if err == nil || err.Error() != want {
+		t.Fatalf("err %v, want %q", err, want)
+	}
+}
+
+func TestRemoteErrorBodyIsShort(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, strings.Repeat("x", 1000), http.StatusBadRequest)
+	}))
+	defer srv.Close()
+
+	_, err := Remote(srv.URL).Goroutines(context.Background(), 1)
+	if err == nil || !strings.Contains(err.Error(), strings.Repeat("x", 200)) || strings.Contains(err.Error(), strings.Repeat("x", 201)) {
+		t.Fatalf("err %v, want a body cut to 200 bytes", err)
+	}
+}
+
+func TestRemoteErrorWithoutBody(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusBadGateway)
+	}))
+	defer srv.Close()
+
+	_, err := Remote(srv.URL).Goroutines(context.Background(), 1)
+
+	want := "GET " + srv.URL + "/debug/pprof/goroutine?debug=1: 502 Bad Gateway"
+	if err == nil || err.Error() != want {
+		t.Fatalf("err %v, want %q", err, want)
+	}
+}
+
+func TestRemoteNameHidesPasswordOfUnparsableURL(t *testing.T) {
+	got := Remote("http://u:secret@host/%zz").Name()
+	if strings.Contains(got, "secret") || !strings.HasPrefix(got, "http://u:") || !strings.HasSuffix(got, "@host/%zz") {
+		t.Fatalf("name = %q", got)
+	}
+}
+
+func TestRemoteErrorsHidePassword(t *testing.T) {
+	srv := httptest.NewServer(http.NotFoundHandler())
+	srv.Close()
+
+	for _, base := range []string{"http://u:secret@host/%zz", strings.Replace(srv.URL, "http://", "http://u:secret@", 1)} {
+		_, err := Remote(base).Goroutines(context.Background(), 1)
+		if err == nil || strings.Contains(err.Error(), "secret") {
+			t.Errorf("%s: err %v must not contain the password", base, err)
+		}
 	}
 }

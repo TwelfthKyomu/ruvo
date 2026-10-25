@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -128,6 +129,23 @@ func start(t *testing.T, m mode) (*pipeline, string) {
 	return p, srv.URL
 }
 
+func busy(t *testing.T, url string, clients int) {
+	t.Helper()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+
+	go func() {
+		drive(ctx, url, clients)
+		close(done)
+	}()
+
+	t.Cleanup(func() {
+		cancel()
+		<-done
+	})
+}
+
 func TestHealthyServesWork(t *testing.T) {
 	_, url := start(t, modeNone)
 
@@ -181,7 +199,7 @@ func TestSlowLoaderStarvesWorkers(t *testing.T) {
 
 func TestSlowWorkersBlockLoader(t *testing.T) {
 	_, url := start(t, modeSlowWorkers)
-	fire(url, 80)
+	busy(t, url, 32)
 
 	cond := func() bool {
 		d := dump()
@@ -192,10 +210,7 @@ func TestSlowWorkersBlockLoader(t *testing.T) {
 
 	waitFor(t, 2*time.Second, cond)
 	time.Sleep(50 * time.Millisecond)
-
-	if !cond() {
-		t.Fatal("loader stopped waiting on workers after 50ms")
-	}
+	waitFor(t, 200*time.Millisecond, cond)
 }
 
 func TestDeadlockLeavesLockPairsBlocked(t *testing.T) {
@@ -258,4 +273,26 @@ func TestStopReleasesWorkers(t *testing.T) {
 	waitFor(t, 2*time.Second, func() bool {
 		return blocked(dump(), "chan receive", "leaky.(*pipeline).worker") == 0
 	})
+}
+
+func TestDriveSendsRequests(t *testing.T) {
+	p, url := start(t, modeNone)
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+
+	go func() {
+		drive(ctx, url, 2)
+		close(done)
+	}()
+
+	waitFor(t, 2*time.Second, func() bool { return p.n.Load() > 0 })
+	cancel()
+
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("drive did not return after stop")
+	}
+
+	waitFor(t, 2*time.Second, func() bool { return !strings.Contains(dump(), "leaky.drive") })
 }

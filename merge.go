@@ -1,6 +1,7 @@
 package ruvo
 
 import (
+	"slices"
 	"time"
 
 	"github.com/TwelfthKyomu/ruvo/internal/dump"
@@ -12,12 +13,20 @@ type fullState struct {
 	bySite map[string]fullGroup
 	seen   map[int64]seenAt
 	maxID  int64
+	spawns map[[2]endpoint]int
+	count  int
+	cut    bool
 }
 
 type fullGroup struct {
 	state     string
 	createdBy string
 	maxWait   time.Duration
+	frames    []dump.Frame
+}
+
+func (g fullGroup) calls(fn string) bool {
+	return slices.ContainsFunc(g.frames, func(f dump.Frame) bool { return f.Func == fn })
 }
 
 type seenAt struct {
@@ -28,21 +37,28 @@ type seenAt struct {
 func (f *fullState) update(at time.Time, gs []dump.Goroutine) {
 	states := map[string]map[string]int{}
 	groups := map[string]fullGroup{}
-	sites := map[string]string{}
+	ends := map[string]endpoint{}
 	seen := map[int64]seenAt{}
 
 	var top int64
 
+	count := 0
+
 	for _, g := range gs {
 		top = max(top, g.ID)
 
-		if isDumpWriter(g.Frames) {
+		if isOwn(g.Frames) {
 			continue
 		}
 
+		count++
+
 		site, entry := groupKey(g.Frames)
 		id := groupID(site, entry)
-		sites[id] = site.String()
+
+		if _, ok := ends[id]; !ok {
+			ends[id] = endpoint{id: id, site: site.String(), entry: entry.Func}
+		}
 
 		since := at
 		if prev, ok := f.seen[g.ID]; ok && prev.group == id && g.Wait > 0 {
@@ -63,6 +79,10 @@ func (f *fullState) update(at time.Time, gs []dump.Goroutine) {
 			fg.createdBy = g.CreatedBy.String()
 		}
 
+		if fg.frames == nil {
+			fg.frames = g.Frames
+		}
+
 		fg.maxWait = max(fg.maxWait, g.Wait, waited)
 		groups[id] = fg
 	}
@@ -74,11 +94,13 @@ func (f *fullState) update(at time.Time, gs []dump.Goroutine) {
 		fg.state = mostCommon(states[id])
 		groups[id] = fg
 
-		if _, dup := bySite[sites[id]]; dup {
-			shared[sites[id]] = true
+		site := ends[id].site
+
+		if _, dup := bySite[site]; dup {
+			shared[site] = true
 		}
 
-		bySite[sites[id]] = fg
+		bySite[site] = fg
 	}
 
 	for site := range shared {
@@ -90,6 +112,35 @@ func (f *fullState) update(at time.Time, gs []dump.Goroutine) {
 	f.bySite = bySite
 	f.seen = seen
 	f.maxID = top
+	f.count = count
+	f.spawns = spawnPairs(gs, seen, ends)
+}
+
+func spawnPairs(gs []dump.Goroutine, seen map[int64]seenAt, ends map[string]endpoint) map[[2]endpoint]int {
+	pairs := map[[2]string]int{}
+
+	for _, g := range gs {
+		if g.Creator == 0 {
+			continue
+		}
+
+		child, ok := seen[g.ID]
+		if !ok {
+			continue
+		}
+
+		if creator, ok := seen[g.Creator]; ok {
+			pairs[[2]string{creator.group, child.group}]++
+		}
+	}
+
+	spawns := make(map[[2]endpoint]int, len(pairs))
+
+	for p, n := range pairs {
+		spawns[[2]endpoint{ends[p[0]], ends[p[1]]}] = n
+	}
+
+	return spawns
 }
 
 func mostCommon(counts map[string]int) string {
@@ -113,7 +164,7 @@ func (l *leakState) update(at time.Time, p dump.Profile) {
 	counts := map[string]int{}
 
 	for _, r := range p.Records {
-		if isDumpWriter(r.Frames) {
+		if isOwn(r.Frames) {
 			continue
 		}
 

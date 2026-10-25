@@ -1,0 +1,24 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.27.x'
+          cache-dependency-path: '**/go.sum'
+      - name: vet
+        run: go vet ./... ./flow/... ./cmd/ruvo/... ./examples/leaky/...
+      - name: test
+        run: go test -race -count=1 ./... ./flow/... ./cmd/ruvo/... ./examples/leaky/...
+      - name: staticcheck
+        run: go run honnef.co/go/tools/cmd/staticcheck@latest ./... ./flow/... ./cmd/ruvo/... ./examples/leaky/...

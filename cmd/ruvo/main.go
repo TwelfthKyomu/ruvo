@@ -2,6 +2,9 @@
 // Point it at any service that exposes net/http/pprof:
 //
 //	ruvo http://localhost:6060
+//
+// It serves the goroutine list at / and the flow view, which draws who wakes
+// whom, at /flow/.
 package main
 
 import (
@@ -20,6 +23,7 @@ import (
 	"time"
 
 	"github.com/TwelfthKyomu/ruvo"
+	"github.com/TwelfthKyomu/ruvo/flow"
 )
 
 const usage = "usage: ruvo [-listen addr] http://host:port"
@@ -34,6 +38,8 @@ func run(args []string, stdout, stderr io.Writer) int {
 	raw, listen, err := parseArgs(args, stderr)
 
 	switch {
+	case errors.Is(err, flag.ErrHelp):
+		return 0
 	case errors.Is(err, errUsage):
 		fmt.Fprintln(stderr, usage)
 		return 2
@@ -61,7 +67,7 @@ func run(args []string, stdout, stderr io.Writer) int {
 		return 1
 	}
 
-	srv := &http.Server{Handler: ruvo.NewHandler(ruvo.Remote(target)), ReadHeaderTimeout: 10 * time.Second}
+	srv := &http.Server{Handler: newHandler(target), ReadHeaderTimeout: 10 * time.Second}
 
 	go func() {
 		<-ctx.Done()
@@ -72,7 +78,7 @@ func run(args []string, stdout, stderr io.Writer) int {
 		srv.Shutdown(shutdown)
 	}()
 
-	fmt.Fprintf(stdout, "ruvo: watching %s\nruvo: open http://%s/\n", redact(target), shown(listen, ln.Addr()))
+	fmt.Fprintf(stdout, "ruvo: watching %s\nruvo: open http://%s/flow/\n", redact(target), shown(listen, ln.Addr()))
 
 	if err := srv.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		fmt.Fprintln(stderr, "ruvo:", err)
@@ -80,6 +86,10 @@ func run(args []string, stdout, stderr io.Writer) int {
 	}
 
 	return 0
+}
+
+func newHandler(target string) http.Handler {
+	return ruvo.NewHandler(ruvo.Remote(target), flow.View())
 }
 
 func parseArgs(args []string, stderr io.Writer) (string, string, error) {
@@ -138,7 +148,31 @@ func redact(target string) string {
 		return u.Redacted()
 	}
 
-	return target
+	return hidePassword(target)
+}
+
+func hidePassword(s string) string {
+	scheme, rest, ok := strings.Cut(s, "://")
+	if !ok {
+		return s
+	}
+
+	authority := rest
+	if i := strings.IndexAny(rest, "/?#"); i >= 0 {
+		authority = rest[:i]
+	}
+
+	at := strings.LastIndexByte(authority, '@')
+	if at < 0 {
+		return s
+	}
+
+	colon := strings.IndexByte(authority[:at], ':')
+	if colon < 0 {
+		return s
+	}
+
+	return scheme + "://" + rest[:colon+1] + "xxxxx" + rest[at:]
 }
 
 func check(ctx context.Context, target string) error {

@@ -55,6 +55,7 @@ type fullParser struct {
 	pending string
 	created bool
 	broken  bool
+	origin  bool
 }
 
 func (p *fullParser) line(line string) {
@@ -65,6 +66,8 @@ func (p *fullParser) line(line string) {
 		p.finish()
 		p.header(line)
 	case p.cur == nil:
+	case p.origin || strings.HasPrefix(line, "[originating from goroutine"):
+		p.origin = true
 	case strings.HasPrefix(line, "\t"):
 		p.fileLine(line)
 	case strings.HasPrefix(line, "created by "):
@@ -112,6 +115,7 @@ func (p *fullParser) header(line string) {
 	p.pending = ""
 	p.created = false
 	p.broken = false
+	p.origin = false
 }
 
 func (p *fullParser) fileLine(line string) {
@@ -154,6 +158,7 @@ func (p *fullParser) finish() {
 	p.pending = ""
 	p.created = false
 	p.broken = false
+	p.origin = false
 }
 
 func isHeader(line string) bool {

@@ -34,8 +34,13 @@ func ParseStacks(r io.Reader) (Profile, error) {
 		return Profile{}, fmt.Errorf("dump: not a debug=1 profile: %s", quote(sc.Text()))
 	}
 
+	if total < 0 {
+		return Profile{}, fmt.Errorf("dump: negative goroutine total %d", total)
+	}
+
 	p := Profile{Total: total}
 	cur := -1
+	sum := 0
 
 	for sc.Scan() {
 		line := sc.Text()
@@ -50,13 +55,26 @@ func ParseStacks(r io.Reader) (Profile, error) {
 			}
 		default:
 			if n, ok := parseCount(line); ok {
+				if n < 1 {
+					return Profile{}, fmt.Errorf("dump: bad record count: %s", quote(line))
+				}
+
+				sum += n
 				p.Records = append(p.Records, Record{Count: n})
 				cur = len(p.Records) - 1
 			}
 		}
 	}
 
-	return p, sc.Err()
+	if err := sc.Err(); err != nil {
+		return Profile{}, err
+	}
+
+	if sum != total {
+		return Profile{}, fmt.Errorf("dump: incomplete profile: %d of %d goroutines", sum, total)
+	}
+
+	return p, nil
 }
 
 func parseTotal(line string) (int, bool) {
@@ -71,8 +89,8 @@ func parseTotal(line string) (int, bool) {
 }
 
 func parseCount(line string) (int, bool) {
-	n, _, ok := strings.Cut(line, " @ ")
-	if !ok {
+	n, rest, ok := strings.Cut(line, " @")
+	if !ok || (rest != "" && rest[0] != ' ') {
 		return 0, false
 	}
 

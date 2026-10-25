@@ -19,6 +19,22 @@ go run ./examples/leaky
 Flags: `-addr` (default `localhost:6061`), `-workers` (default `8`),
 `-break` (initial mode, default `none`).
 
+## Load
+
+The flow page draws arrows only for goroutines that were woken while **Record
+trace** was running, so an idle leaky shows none. Send it load from a second
+terminal:
+
+```bash
+go run ./examples/leaky -load localhost:6061 -clients 32
+```
+
+With `-load <addr>`, leaky does not serve: `-clients` (default `32`) clients
+call `/work` at that address in a loop until Ctrl+C, each waiting up to
+2 seconds for an answer and pausing 100 ms after an error or a non-200 answer.
+It runs as a separate process so its own goroutines stay out of what ruvo
+shows.
+
 ## Endpoints
 
 | Path | What it does |

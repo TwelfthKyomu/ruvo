@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -122,6 +123,86 @@ func TestEventsStreamsSnapshots(t *testing.T) {
 	waitFor(t, 2*time.Second, func() bool { return c.subscribers() == 0 })
 }
 
+func TestEventsDoNotRepeatFirstSnapshot(t *testing.T) {
+	srv, _ := serve(t, newFake(t, "stacks.txt", "full.txt", ""))
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, srv.URL+"/api/events", nil)
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	defer resp.Body.Close()
+
+	ats := make(chan time.Time, 4)
+
+	go func() {
+		sc := bufio.NewScanner(resp.Body)
+		sc.Buffer(make([]byte, 64*1024), 1<<20)
+
+		for sc.Scan() {
+			data, ok := strings.CutPrefix(sc.Text(), "data: ")
+			if !ok {
+				continue
+			}
+
+			var s Snapshot
+
+			if json.Unmarshal([]byte(data), &s) == nil {
+				ats <- s.At
+			}
+		}
+	}()
+
+	var first time.Time
+
+	select {
+	case first = <-ats:
+	case <-time.After(2 * time.Second):
+		t.Fatal("no snapshot event within 2s")
+	}
+
+	select {
+	case at := <-ats:
+		if at.Equal(first) {
+			t.Fatalf("the first snapshot (at %v) was sent twice", first)
+		}
+	case <-time.After(300 * time.Millisecond):
+	}
+}
+
+func TestEventsHeadDoesNotStream(t *testing.T) {
+	srv, c := serve(t, newFake(t, "stacks.txt", "full.txt", ""))
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	req, _ := http.NewRequestWithContext(ctx, http.MethodHead, srv.URL+"/api/events", nil)
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	resp.Body.Close()
+
+	if ct := resp.Header.Get("Content-Type"); resp.StatusCode != http.StatusOK || ct != "text/event-stream" {
+		t.Fatalf("status %d, content type %q", resp.StatusCode, ct)
+	}
+
+	if n := c.subscribers(); n != 0 {
+		t.Fatalf("%d subscribers after HEAD, want 0", n)
+	}
+
+	if code, _, hdr := call(t, http.MethodPost, srv.URL+"/api/events"); code != http.StatusMethodNotAllowed || hdr.Get("Allow") != "GET, HEAD" {
+		t.Fatalf("POST: status %d, Allow %q", code, hdr.Get("Allow"))
+	}
+}
+
 func TestLeaksEndpoint(t *testing.T) {
 	srv, _ := serve(t, newFake(t, "stacks.txt", "full.txt", "leak.txt"))
 
@@ -195,6 +276,44 @@ func (p probeView) Handler(api http.Handler) http.Handler {
 	})
 }
 
+func TestIndexLinksViews(t *testing.T) {
+	v := probeView{path: make(chan string, 1), gotAPI: make(chan bool, 1)}
+	srv, _ := serve(t, newFake(t, "stacks.txt", "", ""), v)
+
+	code, body, hdr := call(t, http.MethodGet, srv.URL+"/")
+	if code != http.StatusOK || !strings.HasPrefix(hdr.Get("Content-Type"), "text/html") {
+		t.Fatalf("status %d, content type %q", code, hdr.Get("Content-Type"))
+	}
+
+	if !strings.Contains(body, `<nav id="views"><a href="./probe/">probe</a></nav>`) {
+		t.Fatal("no link to the view in the nav")
+	}
+}
+
+type namedView string
+
+func (v namedView) Name() string { return string(v) }
+
+func (namedView) Handler(api http.Handler) http.Handler { return http.NotFoundHandler() }
+
+func TestIndexEscapesViewNames(t *testing.T) {
+	srv, _ := serve(t, newFake(t, "stacks.txt", "", ""), namedView("b"), namedView(`a<"&`))
+
+	_, body, _ := call(t, http.MethodGet, srv.URL+"/")
+	if !strings.Contains(body, `<nav id="views"><a href="./a%3C%22&amp;/">a&lt;&#34;&amp;</a><a href="./b/">b</a></nav>`) {
+		t.Fatal("view names are not escaped or not sorted in the nav")
+	}
+}
+
+func TestIndexWithoutViewsKeepsEmptyNav(t *testing.T) {
+	srv, _ := serve(t, newFake(t, "stacks.txt", "", ""))
+
+	_, body, _ := call(t, http.MethodGet, srv.URL+"/")
+	if !strings.Contains(body, `<nav id="views"></nav>`) {
+		t.Fatal("the empty nav is gone")
+	}
+}
+
 func TestViewsMounted(t *testing.T) {
 	v := probeView{path: make(chan string, 1), gotAPI: make(chan bool, 1)}
 	srv, _ := serve(t, newFake(t, "stacks.txt", "", ""), v)
@@ -207,6 +326,70 @@ func TestViewsMounted(t *testing.T) {
 
 	if got := <-v.path; got != "/" {
 		t.Fatalf("view saw path %q, want /", got)
+	}
+}
+
+func noRedirect() *http.Client {
+	return &http.Client{CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
+}
+
+func location(t *testing.T, url string) (int, string) {
+	t.Helper()
+
+	resp, err := noRedirect().Get(url)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	resp.Body.Close()
+
+	loc, err := resp.Location()
+	if err != nil {
+		return resp.StatusCode, ""
+	}
+
+	return resp.StatusCode, loc.RequestURI()
+}
+
+func TestViewWithoutSlashRedirects(t *testing.T) {
+	v := probeView{path: make(chan string, 8), gotAPI: make(chan bool, 1)}
+
+	h := NewHandler(Source{src: newFake(t, "stacks.txt", "", "")}, v).(*handler)
+	t.Cleanup(h.c.close)
+
+	mux := http.NewServeMux()
+	mux.Handle("/", h)
+	mux.Handle("/debug/ruvo/", h)
+	mux.Handle("/x/", http.StripPrefix("/x", h))
+	mux.Handle("/y/", http.StripPrefix("/y/", h))
+
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	for in, want := range map[string]string{
+		"/probe":             "/probe/",
+		"/probe?a=1&b=":      "/probe/?a=1&b=",
+		"/debug/ruvo/probe":  "/debug/ruvo/probe/",
+		"/x/probe?seconds=3": "/x/probe/?seconds=3",
+		"/y/probe":           "/y/probe/",
+	} {
+		code, loc := location(t, srv.URL+in)
+		if (code != http.StatusMovedPermanently && code != http.StatusPermanentRedirect) || loc != want {
+			t.Errorf("GET %s: status %d, location %q; want a redirect to %q", in, code, loc, want)
+		}
+	}
+
+	if code, _, _ := call(t, http.MethodGet, srv.URL+"/probe"); code != http.StatusOK {
+		t.Fatalf("following the redirect: status %d", code)
+	}
+
+	select {
+	case got := <-v.path:
+		if got != "/" {
+			t.Fatalf("view saw path %q, want /", got)
+		}
+	default:
+		t.Fatal("the view was not reached")
 	}
 }
 
@@ -251,6 +434,57 @@ func TestLocalHandlerSeesParked(t *testing.T) {
 	}
 
 	t.Fatalf("no group for parked goroutines in %d groups", len(s.Groups))
+}
+
+func TestLocalHandlerHidesItself(t *testing.T) {
+	h := Handler().(*handler)
+	t.Cleanup(h.c.close)
+
+	srv := httptest.NewServer(h)
+	defer srv.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, srv.URL+"/api/events", nil)
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	defer resp.Body.Close()
+
+	sc := bufio.NewScanner(resp.Body)
+	sc.Buffer(make([]byte, 64*1024), 1<<20)
+
+	for sc.Scan() {
+		if strings.HasPrefix(sc.Text(), "data: ") {
+			break
+		}
+	}
+
+	h.c.sample(context.Background(), false)
+
+	_, body, _ := call(t, http.MethodGet, srv.URL+"/api/snapshot")
+
+	var s Snapshot
+
+	if err := json.Unmarshal([]byte(body), &s); err != nil {
+		t.Fatal(err)
+	}
+
+	if len(s.Groups) == 0 {
+		t.Fatal("no groups at all")
+	}
+
+	for _, g := range s.Groups {
+		for _, line := range g.Stack {
+			if strings.HasPrefix(line, "github.com/TwelfthKyomu/ruvo.(*handler)") || strings.HasPrefix(line, "github.com/TwelfthKyomu/ruvo.(*collector)") {
+				t.Fatalf("ruvo's own goroutine is in group %s: %v", g.WaitSite, g.Stack)
+			}
+		}
+	}
 }
 
 func TestCrossOriginPostRejected(t *testing.T) {
@@ -360,5 +594,95 @@ func TestZeroSourceIsLocal(t *testing.T) {
 
 	if code, body, _ := call(t, http.MethodGet, srv.URL+"/api/snapshot"); code != http.StatusOK || !strings.Contains(body, `"target":"this process"`) {
 		t.Fatalf("status %d, body %.120s", code, body)
+	}
+}
+
+type readerView struct {
+	err error
+}
+
+func (readerView) Name() string { return "reader" }
+
+func (readerView) Handler(api http.Handler) http.Handler { return http.NotFoundHandler() }
+
+func (v readerView) ReadTrace(trace io.Reader, stacks map[int64][]Frame) ([]Wakeup, error) {
+	return nil, v.err
+}
+
+func TestTraceEndpoint(t *testing.T) {
+	src := newFake(t, "stacks.txt", "full.txt", "")
+	srv, _ := serve(t, src, readerView{})
+
+	code, body, _ := call(t, http.MethodPost, srv.URL+"/api/trace?seconds=2")
+	if code != http.StatusOK {
+		t.Fatalf("status %d, body %.120s", code, body)
+	}
+
+	var s Snapshot
+
+	if err := json.Unmarshal([]byte(body), &s); err != nil || s.TraceFor != 2*time.Second || !strings.Contains(body, `"traceFor":2000000000`) {
+		t.Fatalf("%v: body %.200s", err, body)
+	}
+
+	src.mu.Lock()
+	d := src.traceD
+	src.mu.Unlock()
+
+	if d != 2*time.Second {
+		t.Fatalf("trace asked for %v, want 2s", d)
+	}
+
+	src = newFake(t, "stacks.txt", "full.txt", "")
+	srv, _ = serve(t, src, readerView{})
+
+	if code, body, _ := call(t, http.MethodPost, srv.URL+"/api/trace"); code != http.StatusOK || !strings.Contains(body, `"traceFor":5000000000`) {
+		t.Fatalf("no seconds: status %d, body %.200s", code, body)
+	}
+
+	src.mu.Lock()
+	d = src.traceD
+	src.mu.Unlock()
+
+	if d != 5*time.Second {
+		t.Fatalf("trace asked for %v, want the 5s default", d)
+	}
+
+	if code, _, hdr := call(t, http.MethodGet, srv.URL+"/api/trace"); code != http.StatusMethodNotAllowed || hdr.Get("Allow") != http.MethodPost {
+		t.Fatalf("GET: status %d, Allow %q", code, hdr.Get("Allow"))
+	}
+}
+
+func TestTraceEndpointErrors(t *testing.T) {
+	src := newFake(t, "stacks.txt", "full.txt", "")
+	srv, _ := serve(t, src, readerView{})
+
+	for _, q := range []string{"0", "31", "abc", "-1", "2.5", "9223372036854775807", "18446744074"} {
+		if code, body, _ := call(t, http.MethodPost, srv.URL+"/api/trace?seconds="+q); code != http.StatusBadRequest {
+			t.Errorf("seconds=%s: status %d, body %q, want 400", q, code, body)
+		}
+	}
+
+	if n := src.count("trace"); n != 0 {
+		t.Fatalf("%d traces for bad requests, want 0", n)
+	}
+
+	srv, _ = serve(t, newFake(t, "stacks.txt", "full.txt", ""))
+
+	if code, body, _ := call(t, http.MethodPost, srv.URL+"/api/trace"); code != http.StatusNotFound || !strings.Contains(body, "no view reads traces: mount flow.View()") {
+		t.Fatalf("no reader: status %d, body %q", code, body)
+	}
+
+	src = newFake(t, "stacks.txt", "full.txt", "")
+	src.traceErr = fmt.Errorf("%w: GET …/debug/pprof/trace?seconds=5: 404 Not Found", collect.ErrNoTrace)
+	srv, _ = serve(t, src, readerView{})
+
+	if code, body, _ := call(t, http.MethodPost, srv.URL+"/api/trace"); code != http.StatusBadGateway || !strings.Contains(body, "trace profile is not available") {
+		t.Fatalf("trace error: status %d, body %q", code, body)
+	}
+
+	srv, _ = serve(t, newFake(t, "stacks.txt", "full.txt", ""), readerView{err: errors.New("bad header")})
+
+	if code, body, _ := call(t, http.MethodPost, srv.URL+"/api/trace"); code != http.StatusBadGateway || !strings.Contains(body, "read trace: bad header") {
+		t.Fatalf("reader error: status %d, body %q", code, body)
 	}
 }
