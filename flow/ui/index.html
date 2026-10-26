@@ -1259,13 +1259,14 @@
     }
 
     function labelText(l) {
-        return Object.keys(l.labels).sort().map((k) => k + "=" + l.labels[k]).join(" ") + " ×" + l.count;
+        const labels = l.labels || {};
+        return Object.keys(labels).sort().map((k) => k + "=" + labels[k]).join(" ") + " ×" + l.count;
     }
 
     function banner() {
         if (lost) return "Lost connection to ruvo — retrying…";
         if (!snap) return "";
-        if (snap.offline) return "Opened from a file: this is what ruvo saw at " + new Date(snap.at).toLocaleString() + ". Nothing reads the target, so the actions are off.";
+        if (snap.offline) return "Opened from a file: this is what ruvo saw at " + new Date(snap.at).toLocaleString() + ". Nothing reads the target, so the actions are off." + (snap.error ? " The last read before the file was saved failed (" + snap.error + "): the groups are the last data read before that." : "");
         if (snap.error) return "Cannot read the target: " + snap.error;
         const quiet = Date.now() - fresh;
         if (quiet > Math.max(3 * snap.interval / 1e6, 15000)) return "No new data for " + ago(quiet).replace(" ago", "") + ".";
@@ -1277,7 +1278,7 @@
         const b = $("banner");
         b.textContent = text;
         b.classList.toggle("on", text !== "");
-        b.classList.toggle("info", !lost && !!(snap && snap.offline));
+        b.classList.toggle("info", !lost && !!(snap && snap.offline && !snap.error));
         $("hint").hidden = !!(snap && (snap.traceAt || snap.offline));
         if (!snap) return;
         $("target").textContent = snap.target || "";
@@ -1324,7 +1325,7 @@
             let top = null;
             for (const e of m.stats.get(m.jam).ins) if (!top || (e.wait || 0) > (top.wait || 0)) top = e;
             const source = !top ? "" : top.from === top.to ? "each other" : top.from === "network" || top.from === "timer" ? "the " + top.from : named(top.from, m);
-            if (top) out.push("Jam: " + name(g) + " ×" + count(g.count) + " wait mostly for " + source + " (" + handoff(top) + ").");
+            if (top) out.push("Jam: " + name(g) + " ×" + count(g.count) + (top.approx ? " probably wait" : " wait") + " mostly for " + source + " (" + handoff(top) + (top.approx ? "; the arrow is matched by wait site or start function" : "") + ").");
             told.add(m.jam);
         }
         const growing = most("growthPerMin");
@@ -1370,12 +1371,19 @@
     let stacks = new Map();
 
     function remember(s) {
-        stacks = new Map((s.groups || []).map((g) => [g.id, g.stack]));
+        stacks = new Map((s.groups || []).map((g) => [g.id, g.stack || []]));
         return s;
     }
 
     function fill(s) {
-        for (const g of s.groups || []) g.stack = stacks.get(g.id) || [];
+        const next = new Map();
+        for (const g of s.groups || []) {
+            const stack = g.stack || stacks.get(g.id);
+            if (!stack) return null;
+            next.set(g.id, stack);
+        }
+        stacks = next;
+        for (const g of s.groups || []) g.stack = next.get(g.id);
         return s;
     }
 
@@ -1389,7 +1397,12 @@
             show(s);
         };
         es.addEventListener("snapshot", (e) => got(remember(JSON.parse(e.data))));
-        es.addEventListener("update", (e) => got(fill(JSON.parse(e.data))));
+        es.addEventListener("update", (e) => {
+            const s = fill(JSON.parse(e.data));
+            if (s) return got(s);
+            es.close();
+            connect();
+        });
         es.onerror = () => {
             disconnected();
             if (!poller) poller = setInterval(poll, 5000);

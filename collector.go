@@ -68,8 +68,10 @@ type collector struct {
 }
 
 type message struct {
-	s   Snapshot
-	enc *encoded
+	s    Snapshot
+	base int64
+	prev []Group
+	enc  *encoded
 }
 
 type encoded struct {
@@ -79,8 +81,8 @@ type encoded struct {
 	lean     []byte
 }
 
-func newMessage(s Snapshot) message {
-	return message{s: s, enc: &encoded{}}
+func newMessage(prev, s Snapshot) message {
+	return message{s: s, base: prev.Seq, prev: prev.Groups, enc: &encoded{}}
 }
 
 func (m message) full() []byte {
@@ -90,16 +92,29 @@ func (m message) full() []byte {
 }
 
 func (m message) lean() []byte {
-	m.enc.leanOnce.Do(func() { m.enc.lean = encodeJSON(leanSnapshot(m.s)) })
+	m.enc.leanOnce.Do(func() { m.enc.lean = encodeJSON(leanSnapshot(m.s, m.prev)) })
 
 	return m.enc.lean
 }
 
-func leanSnapshot(s Snapshot) Snapshot {
+func leanSnapshot(s Snapshot, prev []Group) Snapshot {
+	known := make(map[string][]string, len(prev))
+
+	for _, g := range prev {
+		known[g.ID] = g.Stack
+	}
+
 	groups := slices.Clone(s.Groups)
 
 	for i := range groups {
-		groups[i].Stack = nil
+		st, ok := known[groups[i].ID]
+
+		switch {
+		case ok && slices.Equal(st, groups[i].Stack):
+			groups[i].Stack = nil
+		case groups[i].Stack == nil:
+			groups[i].Stack = []string{}
+		}
 	}
 
 	s.Groups = groups
@@ -363,6 +378,8 @@ func (c *collector) captureTrace(ctx context.Context, d time.Duration) (Snapshot
 		c.refresh(ctx, false)
 	}
 
+	d = c.traceLength(d)
+
 	return shared(ctx, c, "trace", d+fetchTimeout, func(ctx context.Context) (Snapshot, error) {
 		c.mu.Lock()
 		last := c.traceTry
@@ -431,6 +448,27 @@ func (c *collector) recordTrace(ctx context.Context, d time.Duration) (Snapshot,
 	fresh := c.applyReadLocked(seq, now, p, praw, err)
 
 	return c.publishLocked(now, fresh && err == nil, ""), nil
+}
+
+func (c *collector) traceLength(d time.Duration) time.Duration {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if c.fullTry.recent(c.now()) {
+		return d
+	}
+
+	cost := c.full.cost
+	if cost == 0 {
+		cost = time.Duration(c.last.Goroutines) * fullPerRoutine
+	}
+
+	need := traceDumpDelay + cost*3/2 + traceDumpSlack
+	if need <= d {
+		return d
+	}
+
+	return min((need + time.Second - 1).Truncate(time.Second), traceMax)
 }
 
 func readTrace(r TraceReader, raw []byte, stacks map[int64][]Frame) (ws []Wakeup, err error) {
@@ -690,7 +728,7 @@ func (c *collector) fetchFull(ctx context.Context) (fullDump, error) {
 
 	gs, err := dump.ParseFull(raw)
 
-	return fullDump{gs: gs, raw: raw, cost: time.Since(start), cut: len(raw) >= c.fullCap}, err
+	return fullDump{gs: gs, raw: raw, cost: time.Since(start), cut: len(raw) == c.fullCap}, err
 }
 
 func (c *collector) fetchLeaks(ctx context.Context) (dump.Profile, []byte, error) {
@@ -716,6 +754,7 @@ func (c *collector) applyFullLocked(now time.Time, fd fullDump) {
 	c.full.update(now, fd.gs)
 	c.full.cut = fd.cut
 	c.full.raw = fd.raw
+	c.full.cost = fd.cost
 	c.fullEvery = nextInterval(fd.cost, fullFactor, fullMin, fullMax)
 	c.nextFull = now.Add(c.fullEvery)
 }
@@ -731,6 +770,7 @@ func maxID(gs []dump.Goroutine) int64 {
 }
 
 func (c *collector) failLocked(now time.Time) Snapshot {
+	prev := c.last
 	c.seq = max(c.seq+1, now.UnixMicro())
 	c.last.Seq = c.seq
 	c.last.At = now
@@ -746,7 +786,7 @@ func (c *collector) failLocked(now time.Time) Snapshot {
 		c.last.Edges = []Edge{}
 	}
 
-	c.broadcastLocked(c.last)
+	c.broadcastLocked(prev, c.last)
 
 	return c.last
 }
@@ -792,6 +832,7 @@ func (c *collector) publishLocked(now time.Time, record bool, note string) Snaps
 		return cmp.Or(cmp.Compare(b.Count, a.Count), cmp.Compare(a.ID, b.ID))
 	})
 
+	prev := c.last
 	c.seq = max(c.seq+1, now.UnixMicro())
 	c.last = Snapshot{
 		Seq:          c.seq,
@@ -811,17 +852,17 @@ func (c *collector) publishLocked(now time.Time, record bool, note string) Snaps
 		Edges:        edges,
 	}
 
-	c.broadcastLocked(c.last)
+	c.broadcastLocked(prev, c.last)
 
 	return c.last
 }
 
-func (c *collector) broadcastLocked(s Snapshot) {
+func (c *collector) broadcastLocked(prev, s Snapshot) {
 	if len(c.subs) == 0 {
 		return
 	}
 
-	m := newMessage(s)
+	m := newMessage(prev, s)
 
 	for ch := range c.subs {
 		select {

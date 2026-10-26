@@ -226,7 +226,10 @@ func BenchmarkPublish(b *testing.B) {
 			b.ReportAllocs()
 
 			for b.Loop() {
+				c.pmu.Lock()
 				p, err := c.strs.ParseStacks(raw)
+				c.pmu.Unlock()
+
 				if err != nil {
 					b.Fatal(err)
 				}
@@ -271,7 +274,12 @@ func BenchmarkExport(b *testing.B) {
 			for b.Loop() {
 				w := &counter{}
 
-				if err := writeSession(w, s); err != nil {
+				p, err := pack(s)
+				if err != nil {
+					b.Fatal(err)
+				}
+
+				if err := p.write(w); err != nil {
 					b.Fatal(err)
 				}
 
@@ -315,7 +323,7 @@ func BenchmarkEncode(b *testing.B) {
 			var size int
 
 			for b.Loop() {
-				size = len(enc(newMessage(s)))
+				size = len(enc(newMessage(s, s)))
 			}
 
 			b.ReportMetric(float64(size)/1024, "KB/event")

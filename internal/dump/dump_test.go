@@ -6,6 +6,7 @@ import (
 	"os"
 	"reflect"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 )
@@ -71,6 +72,9 @@ func TestParseStacksRejectsDamaged(t *testing.T) {
 		"negative total": "goroutine profile: total -1\n",
 		"zero count":     "goroutine profile: total 0\n0 @ 0x1\n",
 		"negative count": "goroutine profile: total 1\n-1 @ 0x1\n2 @ 0x2\n",
+		"wrapped sum":    "goroutine profile: total 999999999999999999\n" + strings.Repeat("999999999999999999 @ 0x1\n\n", 19),
+		"wrapped int32":  "goroutine profile: total 2147483645\n" + strings.Repeat("2147483647 @ 0x1\n\n", 3),
+		"too many":       "goroutine profile: total 3\n2 @ 0x1\n\n2 @ 0x2\n",
 	} {
 		if _, err := ParseStacks([]byte(body)); err == nil {
 			t.Errorf("%s: want error", name)
@@ -202,6 +206,23 @@ func TestParseFullHeaderDetails(t *testing.T) {
 
 	if len(gs) != 2 || gs[0].ID != 7 || gs[0].State != "chan receive (leaked)" || gs[0].Wait != 3*time.Minute || gs[1].ID != 8 || gs[1].State != "select" {
 		t.Fatalf("goroutines %+v", gs)
+	}
+}
+
+func TestParseFullWaitBeyondDuration(t *testing.T) {
+	for minutes, want := range map[string]time.Duration{
+		"153722867":          153722867 * time.Minute,
+		"153722868":          0,
+		"999999999999999999": 0,
+	} {
+		gs, err := ParseFull([]byte("goroutine 7 [chan receive, " + minutes + " minutes]:\nmain.f()\n\t/app/main.go:3 +0x1\n"))
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		if gs[0].Wait != want {
+			t.Errorf("%s minutes: wait %v, want %v", minutes, gs[0].Wait, want)
+		}
 	}
 }
 

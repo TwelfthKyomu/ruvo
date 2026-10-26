@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
+	"math"
 	"strconv"
 	"time"
 )
@@ -159,7 +160,7 @@ func (p *fullParser) header(id int64, rest []byte) {
 		part, extra, _ = bytes.Cut(extra, []byte(", "))
 
 		if m, ok := bytes.CutSuffix(part, []byte(" minutes")); ok {
-			if v, ok := atoi(m); ok {
+			if v, ok := atoi64(m); ok && v <= math.MaxInt64/int64(time.Minute) {
 				p.cur.Wait = time.Duration(v) * time.Minute
 			}
 		}

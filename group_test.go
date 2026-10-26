@@ -8,6 +8,7 @@ import (
 	"maps"
 	"os"
 	"runtime/trace"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -220,6 +221,26 @@ func TestIsOwnHidesRuvo(t *testing.T) {
 
 	if !isOwn(deep) {
 		t.Error("isOwn must look at every frame, not only the top one")
+	}
+}
+
+func TestOwnFuncsFollowModulePath(t *testing.T) {
+	if modulePath != "github.com/TwelfthKyomu/ruvo" {
+		t.Fatalf("modulePath %q", modulePath)
+	}
+
+	fork := ownFuncs("example.com/fork/ruvo")
+
+	own := func(fn string) bool {
+		return slices.ContainsFunc(fork, func(p string) bool { return strings.HasPrefix(fn, p) })
+	}
+
+	if !own("example.com/fork/ruvo.(*handler).serveEvents") || !own("example.com/fork/ruvo/internal/collect.(*local).full") {
+		t.Error("a fork must hide its own goroutines")
+	}
+
+	if own("main.(*handler).ServeHTTP") || own("example.com/app.(*collector).run") {
+		t.Error("a handler or collector type of the program is not ruvo's")
 	}
 }
 

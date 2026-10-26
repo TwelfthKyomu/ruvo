@@ -21,6 +21,8 @@ const (
 	traceDefault   = 5 * time.Second
 	traceMax       = 30 * time.Second
 	traceDumpDelay = 200 * time.Millisecond
+	traceDumpSlack = 500 * time.Millisecond
+	fullPerRoutine = 25 * time.Microsecond
 	fullDumpCap    = 64 << 20
 
 	eventWriteTimeout = 10 * time.Second

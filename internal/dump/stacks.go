@@ -89,6 +89,10 @@ func (in *Strings) ParseStacks(data []byte) (Profile, error) {
 				return Profile{}, fmt.Errorf("dump: bad record count: %s", quote(line))
 			}
 
+			if n > total-sum {
+				return Profile{}, fmt.Errorf("dump: records hold more than the %d goroutines of the profile", total)
+			}
+
 			flush()
 
 			sum += n

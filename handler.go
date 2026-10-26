@@ -233,12 +233,6 @@ func (h *handler) serveEvents(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	var known map[string]bool
-
-	if lean {
-		known = groupIDSet(s)
-	}
-
 	last := s.Seq
 	tick := time.NewTicker(ping)
 	defer tick.Stop()
@@ -254,18 +248,13 @@ func (h *handler) serveEvents(w http.ResponseWriter, r *http.Request) {
 				continue
 			}
 
-			last = m.s.Seq
-
-			switch {
-			case lean && coversGroups(known, m.s):
-				write = func() error { return writeEvent(w, "update", m.lean()) }
-			case lean:
-				known = groupIDSet(m.s)
-
-				fallthrough
-			default:
-				write = func() error { return writeEvent(w, "snapshot", m.full()) }
+			name, data := "snapshot", m.full
+			if lean && m.base == last {
+				name, data = "update", m.lean
 			}
+
+			last = m.s.Seq
+			write = func() error { return writeEvent(w, name, data()) }
 		case <-tick.C:
 			write = func() error { return writePing(w) }
 		}
@@ -310,26 +299,6 @@ func writeEvent(w io.Writer, name string, data []byte) error {
 	_, err := fmt.Fprintf(w, "event: %s\ndata: %s\n\n", name, data)
 
 	return err
-}
-
-func groupIDSet(s Snapshot) map[string]bool {
-	ids := make(map[string]bool, len(s.Groups))
-
-	for _, g := range s.Groups {
-		ids[g.ID] = true
-	}
-
-	return ids
-}
-
-func coversGroups(known map[string]bool, s Snapshot) bool {
-	for _, g := range s.Groups {
-		if !known[g.ID] {
-			return false
-		}
-	}
-
-	return true
 }
 
 func writeJSON(w http.ResponseWriter, s Snapshot) {

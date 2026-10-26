@@ -6,20 +6,24 @@ import (
 	"cmp"
 	"compress/flate"
 	"context"
+	"encoding/binary"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"net/url"
+	"reflect"
 	"runtime/debug"
 	"slices"
 	"strings"
 	"time"
 )
 
+var modulePath = reflect.TypeFor[handler]().PkgPath()
+
 const (
 	sessionFormat = 1
-	modulePath    = "github.com/TwelfthKyomu/ruvo"
 
 	fileReadme    = "README.txt"
 	fileSession   = "session.json"
@@ -33,10 +37,13 @@ const (
 
 var rawFiles = []string{fileStacks, fileFull, fileLeaks, fileTrace, fileTraceFull}
 
+var leaveOut = []string{fileTraceFull, fileTrace, fileLeaks, fileStacks, fileFull}
+
 var sessionLimits = struct {
 	file  int64
 	total int64
-}{file: 80 << 20, total: 320 << 20}
+	dir   int64
+}{file: 80 << 20, total: 320 << 20, dir: 64 << 10}
 
 type session struct {
 	info sessionInfo
@@ -50,6 +57,7 @@ type sessionInfo struct {
 	Target   string        `json:"target"`
 	Exported time.Time     `json:"exported"`
 	Files    []sessionFile `json:"files"`
+	Omitted  []string      `json:"omitted,omitempty"`
 }
 
 type sessionFile struct {
@@ -183,16 +191,83 @@ func (h *handler) serveExport(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	s := h.c.session(r.Context())
+	p, err := pack(h.c.session(r.Context()))
+	if err != nil {
+		http.Error(w, "ruvo: "+err.Error(), http.StatusInternalServerError)
+
+		return
+	}
 
 	w.Header().Set("Content-Type", "application/zip")
-	w.Header().Set("Content-Disposition", `attachment; filename="`+s.fileName()+`"`)
+	w.Header().Set("Content-Disposition", `attachment; filename="`+p.s.fileName()+`"`)
 
 	if r.Method == http.MethodHead {
 		return
 	}
 
-	writeSession(w, s)
+	p.write(w)
+}
+
+type packed struct {
+	s    session
+	info []byte
+	snap []byte
+}
+
+func pack(s session) (packed, error) {
+	snap, err := json.MarshalIndent(s.snap, "", "  ")
+	if err != nil {
+		return packed{}, err
+	}
+
+	if int64(len(snap)) > sessionLimits.file {
+		return packed{}, fmt.Errorf("the snapshot takes %d MB, more than a session can hold", len(snap)>>20)
+	}
+
+	s.info.Omitted = slices.Clone(s.info.Omitted)
+	s.info.Files = slices.DeleteFunc(slices.Clone(s.info.Files), func(f sessionFile) bool {
+		if int64(len(f.data)) <= sessionLimits.file {
+			return false
+		}
+
+		s.info.Omitted = append(s.info.Omitted, f.Name)
+
+		return true
+	})
+
+	for {
+		info, err := json.MarshalIndent(s.info, "", "  ")
+		if err != nil {
+			return packed{}, err
+		}
+
+		total := int64(len(info) + len(snap))
+		for _, f := range s.info.Files {
+			total += int64(len(f.data))
+		}
+
+		if total <= sessionLimits.total {
+			return packed{s: s, info: info, snap: snap}, nil
+		}
+
+		i := droppable(s.info.Files)
+		if i < 0 {
+			return packed{}, errors.New("the session does not fit in a session file")
+		}
+
+		s.info.Omitted = append(s.info.Omitted, s.info.Files[i].Name)
+		s.info.Files = slices.Delete(s.info.Files, i, i+1)
+	}
+}
+
+func droppable(files []sessionFile) int {
+	for _, name := range leaveOut {
+		if i := slices.IndexFunc(files, func(f sessionFile) bool { return f.Name == name }); i >= 0 {
+			return i
+		}
+	}
+
+	return -1
 }
 
 func (s session) fileName() string {
@@ -217,7 +292,7 @@ func (s session) fileName() string {
 	return "ruvo-" + cmp.Or(slug, "session") + "-" + s.info.Exported.Format("20060102-150405") + ".zip"
 }
 
-func writeSession(w io.Writer, s session) error {
+func (p packed) write(w io.Writer) error {
 	zw := zip.NewWriter(w)
 	zw.RegisterCompressor(zip.Deflate, func(out io.Writer) (io.WriteCloser, error) {
 		return flate.NewWriter(out, flate.BestSpeed)
@@ -225,7 +300,7 @@ func writeSession(w io.Writer, s session) error {
 
 	put := func(name string, at time.Time, data []byte) error {
 		if at.IsZero() {
-			at = s.info.Exported
+			at = p.s.info.Exported
 		}
 
 		f, err := zw.CreateHeader(&zip.FileHeader{Name: name, Method: zip.Deflate, Modified: at})
@@ -238,29 +313,19 @@ func writeSession(w io.Writer, s session) error {
 		return err
 	}
 
-	info, err := json.MarshalIndent(s.info, "", "  ")
-	if err != nil {
+	if err := put(fileReadme, time.Time{}, readme(p.s.info)); err != nil {
 		return err
 	}
 
-	snap, err := json.MarshalIndent(s.snap, "", "  ")
-	if err != nil {
+	if err := put(fileSession, time.Time{}, p.info); err != nil {
 		return err
 	}
 
-	if err := put(fileReadme, time.Time{}, readme(s.info)); err != nil {
+	if err := put(fileSnapshot, p.s.snap.At, p.snap); err != nil {
 		return err
 	}
 
-	if err := put(fileSession, time.Time{}, info); err != nil {
-		return err
-	}
-
-	if err := put(fileSnapshot, s.snap.At, snap); err != nil {
-		return err
-	}
-
-	for _, f := range s.info.Files {
+	for _, f := range p.s.info.Files {
 		if err := put(f.Name, f.At, f.data); err != nil {
 			return err
 		}
@@ -304,12 +369,20 @@ func readme(info sessionInfo) []byte {
 		fmt.Fprintf(&b, "  %-26s %s\n", f.Name, line)
 	}
 
+	if len(info.Omitted) > 0 {
+		fmt.Fprintf(&b, "\nLeft out to keep the session within what ruvo -open reads (%d MB): %s\n", sessionLimits.total>>20, strings.Join(info.Omitted, ", "))
+	}
+
 	b.WriteString("\nThe text files are what net/http/pprof serves at /debug/pprof/goroutine\nand /debug/pprof/goroutineleak; any tool that reads Go tracebacks opens\nthe full dumps.\n")
 
 	return b.Bytes()
 }
 
 func readSession(r io.ReaderAt, size int64) (session, error) {
+	if err := checkDirectory(r, size); err != nil {
+		return session{}, err
+	}
+
 	zr, err := zip.NewReader(r, size)
 	if err != nil {
 		return session{}, fmt.Errorf("not a ruvo session: %w", err)
@@ -317,6 +390,10 @@ func readSession(r io.ReaderAt, size int64) (session, error) {
 
 	files := map[string]*zip.File{}
 	for _, f := range zr.File {
+		if files[f.Name] != nil {
+			return session{}, fmt.Errorf("not a ruvo session: %s is in it twice", f.Name)
+		}
+
 		files[f.Name] = f
 	}
 
@@ -401,13 +478,90 @@ func readSession(r io.ReaderAt, size int64) (session, error) {
 
 	s.info.Files = kept
 
-	if s.snap.Groups == nil {
-		s.snap.Groups = []Group{}
-	}
-
-	if s.snap.Edges == nil {
-		s.snap.Edges = []Edge{}
+	if err := checkSnapshot(&s.snap); err != nil {
+		return session{}, fmt.Errorf("ruvo session: %s: %w", fileSnapshot, err)
 	}
 
 	return s, nil
+}
+
+func checkDirectory(r io.ReaderAt, size int64) error {
+	n := min(size, 22+65535)
+	tail := make([]byte, n)
+
+	if _, err := r.ReadAt(tail, size-n); err != nil && !errors.Is(err, io.EOF) {
+		return fmt.Errorf("not a ruvo session: %w", err)
+	}
+
+	i := bytes.LastIndex(tail, []byte("PK\x05\x06"))
+	if i < 0 || len(tail)-i < 22 {
+		return errors.New("not a ruvo session: not a zip file")
+	}
+
+	end := size - n + int64(i)
+	start := min(int64(binary.LittleEndian.Uint32(tail[i+16:])), end-int64(binary.LittleEndian.Uint32(tail[i+12:])))
+
+	if end-start > sessionLimits.dir {
+		return errors.New("not a ruvo session: too many files in it")
+	}
+
+	return nil
+}
+
+func checkSnapshot(s *Snapshot) error {
+	if s.Goroutines < 0 || s.FullCount < 0 || s.TraceUnknown < 0 {
+		return errors.New("negative count")
+	}
+
+	if s.Groups == nil {
+		s.Groups = []Group{}
+	}
+
+	ids := make(map[string]bool, len(s.Groups))
+
+	for i := range s.Groups {
+		g := &s.Groups[i]
+
+		if !isGroupID(g.ID) || ids[g.ID] {
+			return fmt.Errorf("bad or repeated group ID %q", g.ID)
+		}
+
+		ids[g.ID] = true
+
+		if g.Count < 0 || g.Leaked < 0 || g.Unwoken < 0 || g.MaxWait < 0 {
+			return fmt.Errorf("group %s: negative count", g.ID)
+		}
+
+		if g.Stack == nil {
+			g.Stack = []string{}
+		}
+
+		g.Labels = slices.DeleteFunc(g.Labels, func(l LabelCount) bool { return l.Labels == nil || l.Count < 1 })
+	}
+
+	s.Edges = slices.DeleteFunc(s.Edges, func(e Edge) bool {
+		from := ids[e.From] || e.Kind == EdgeUnblock && (e.From == CauseNetwork || e.From == CauseTimer)
+
+		return !from || !ids[e.To] || e.Kind != EdgeUnblock && e.Kind != EdgeSpawn || e.Count < 0 || e.Wait < 0 || e.Waiters < 0
+	})
+
+	if s.Edges == nil {
+		s.Edges = []Edge{}
+	}
+
+	return nil
+}
+
+func isGroupID(id string) bool {
+	if len(id) == 0 || len(id) > 64 {
+		return false
+	}
+
+	for _, c := range []byte(id) {
+		if (c < '0' || c > '9') && (c < 'a' || c > 'f') {
+			return false
+		}
+	}
+
+	return true
 }

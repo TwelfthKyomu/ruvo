@@ -159,8 +159,9 @@ func newGroupIndex(groups map[string]*Group) groupIndex {
 	for id, g := range groups {
 		x.bySite[g.WaitSite] = append(x.bySite[g.WaitSite], id)
 
-		best, ok := x.byEntry[g.Entry]
-		if !ok || g.Count > groups[best].Count || (g.Count == groups[best].Count && id < best) {
+		if _, ok := x.byEntry[g.Entry]; ok {
+			x.byEntry[g.Entry] = ""
+		} else {
 			x.byEntry[g.Entry] = id
 		}
 	}
@@ -189,9 +190,9 @@ func (x groupIndex) resolve(e endpoint) (id string, exact, ok bool) {
 		return "", false, false
 	}
 
-	id, ok = x.byEntry[e.entry]
+	id = x.byEntry[e.entry]
 
-	return id, false, ok
+	return id, false, id != ""
 }
 
 func compatible(e endpoint, g *Group) bool {

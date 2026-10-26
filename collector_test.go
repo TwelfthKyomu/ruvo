@@ -543,6 +543,16 @@ func TestFullCountOfCutDump(t *testing.T) {
 	}
 }
 
+func TestFullDumpLargerThanLocalCapIsWhole(t *testing.T) {
+	src := &fakeSource{debug1: stacksText(1), debug2: []byte("goroutine 5 [select]:\nmain.x()\n\t/home/dev/a.go:7 +0x1\n")}
+	c, _ := newTestCollector(t, src)
+	c.fullCap = len(src.debug2) - 10
+
+	if s := c.sample(context.Background(), true); s.FullCut || s.FullCount != 1 {
+		t.Fatalf("fullCut %v, fullCount %d: a remote body longer than the local buffer was not cut", s.FullCut, s.FullCount)
+	}
+}
+
 func TestFullDumpFailureKeepsStacks(t *testing.T) {
 	src := newFake(t, "stacks.txt", "full.txt", "")
 	src.err2 = errors.New("503 Service Unavailable")

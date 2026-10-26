@@ -258,6 +258,10 @@
             background: var(--hover);
         }
 
+        tr.more td {
+            text-align: center;
+        }
+
         .stack {
             margin: 0;
             padding: 0;
@@ -321,6 +325,8 @@
 <script>
     const $ = (id) => document.getElementById(id);
     const open = new Set();
+    const page = 200;
+    let shown = page;
     let snap = null;
     let received = 0;
     let fresh = 0;
@@ -374,7 +380,7 @@
     function banner() {
         if (lost) return "Lost connection to ruvo — retrying…";
         if (!snap) return "";
-        if (snap.offline) return "Opened from a file: this is what ruvo saw at " + new Date(snap.at).toLocaleString() + ". Nothing reads the target, so the actions are off.";
+        if (snap.offline) return "Opened from a file: this is what ruvo saw at " + new Date(snap.at).toLocaleString() + ". Nothing reads the target, so the actions are off." + (snap.error ? " The last read before the file was saved failed (" + snap.error + "): the groups are the last data read before that." : "");
         if (snap.error) return "Cannot read the target: " + snap.error;
         const quiet = Date.now() - fresh;
         if (quiet > Math.max(3 * snap.interval / 1e6, 15000)) return "No new data for " + ago(quiet).replace(" ago", "") + ".";
@@ -386,7 +392,7 @@
         const b = $("banner");
         b.textContent = text;
         b.classList.toggle("on", text !== "");
-        b.classList.toggle("info", !lost && !!(snap && snap.offline));
+        b.classList.toggle("info", !lost && !!(snap && snap.offline && !snap.error));
         if (!snap) return;
         $("target").textContent = snap.target;
         $("count").textContent = count(snap.goroutines);
@@ -435,7 +441,7 @@
         body.replaceChildren();
         const groups = (snap && snap.groups) || [];
         $("empty").style.display = groups.length ? "none" : "block";
-        for (const g of groups) {
+        for (const g of groups.slice(0, shown)) {
             const tr = el("tr", "row");
             tr.tabIndex = 0;
             tr.dataset.id = g.id;
@@ -462,7 +468,23 @@
             body.append(tr);
             if (open.has(g.id)) body.append(detail(g));
         }
+        if (groups.length > shown) body.append(more(groups.length));
         if (refocus) refocus.focus({preventScroll: true});
+    }
+
+    function more(total) {
+        const tr = el("tr", "more");
+        const td = el("td");
+        td.colSpan = 6;
+        const btn = el("button", "", "Show " + count(Math.min(page, total - shown)) + " more");
+        btn.type = "button";
+        btn.onclick = () => {
+            shown += page;
+            render();
+        };
+        td.append(el("span", "dim", count(shown) + " of " + count(total) + " groups, the largest first. "), btn);
+        tr.append(td);
+        return tr;
     }
 
     function flip(id) {
@@ -489,7 +511,8 @@
     }
 
     function labelText(l) {
-        return Object.keys(l.labels).sort().map((k) => k + "=" + l.labels[k]).join(" ") + " ×" + l.count;
+        const labels = l.labels || {};
+        return Object.keys(labels).sort().map((k) => k + "=" + labels[k]).join(" ") + " ×" + l.count;
     }
 
     function show(s) {
@@ -519,12 +542,19 @@
     let stacks = new Map();
 
     function remember(s) {
-        stacks = new Map((s.groups || []).map((g) => [g.id, g.stack]));
+        stacks = new Map((s.groups || []).map((g) => [g.id, g.stack || []]));
         return s;
     }
 
     function fill(s) {
-        for (const g of s.groups || []) g.stack = stacks.get(g.id) || [];
+        const next = new Map();
+        for (const g of s.groups || []) {
+            const stack = g.stack || stacks.get(g.id);
+            if (!stack) return null;
+            next.set(g.id, stack);
+        }
+        stacks = next;
+        for (const g of s.groups || []) g.stack = next.get(g.id);
         return s;
     }
 
@@ -538,7 +568,12 @@
             show(s);
         };
         es.addEventListener("snapshot", (e) => got(remember(JSON.parse(e.data))));
-        es.addEventListener("update", (e) => got(fill(JSON.parse(e.data))));
+        es.addEventListener("update", (e) => {
+            const s = fill(JSON.parse(e.data));
+            if (s) return got(s);
+            es.close();
+            connect();
+        });
         es.onerror = () => {
             disconnected();
             if (!poller) poller = setInterval(poll, 5000);

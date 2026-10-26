@@ -61,10 +61,17 @@ every goroutine stack and can trigger full dumps and traces.
 ## Keep the numbers in Prometheus
 
 `GET api/metrics` serves the snapshot in the Prometheus text format: whether
-the target answers, how many goroutines and groups it has, and for the 200
-largest groups their size, growth per minute and, after **Find leaks**, the
-leaked count, labelled by `id`, `site` and `entry`; plus when the last full
-dump, leak search and trace ran.
+the target answers, how many goroutines and groups it has, and the size,
+growth per minute and, after **Find leaks**, leaked count of the 200 largest
+groups, labelled by `wait` (the function they wait in) and `entry` (the
+function they were started with). The labels carry no file or line, so a
+series survives a deploy that moves code; groups that differ only in the line
+add up into one series. `ruvo_group_series_omitted` says how many series were
+left out of the 200, and `ruvo_leaked_goroutines` counts leaks in all groups,
+so a small leaking group still shows. Timestamps say when the snapshot, the
+last full dump, leak search and trace were taken. For a session opened from a
+file, `ruvo_offline` is 1 and `ruvo_target_up` is what it was when the file was
+saved.
 
 ```yaml
 scrape_configs:
@@ -92,15 +99,19 @@ data behind it, so the diagnosis can be checked without the service.
 | `trace-goroutines-full.txt` | the full dump taken while that trace ran, if it is not the last full dump |
 | `session.json`, `README.txt` | when each file was read, the target, the versions of ruvo and Go |
 
-Only files ruvo has are included. Open the session again, without the
-service:
+Only files ruvo has are included. A session holds what `ruvo -open` reads: no
+file over 80 MB and 320 MB in all. When the files are larger, ruvo leaves out
+the trace dump, then the trace, the leak profile and the `debug=1` profile, in
+that order, and says in `README.txt` and in `omitted` in `session.json` what is
+missing. Open the session again, without the service:
 
 ```bash
 ruvo -open ruvo-localhost-6060-20261026-150405.zip
 ```
 
 The pages show the saved snapshot as it was, with a note that it comes from a
-file; Full dump, Find leaks and Record trace are off. In your own code,
+file, and the error if the last read before saving failed; Full dump, Find
+leaks and Record trace are off. In your own code,
 `ruvo.OpenSession` serves a session file the same way.
 
 ## Who wakes whom
@@ -134,7 +145,9 @@ them. Press **Record trace**: ruvo records an execution trace of the target for
 - **Dotted arrow** — the group an end of the arrow was recorded for is gone,
   and ruvo matched it to a current group by its wait site (only when the two
   stacks share the start function) or by its start function alone. A match that
-  fits more than one group is dropped rather than guessed.
+  fits more than one group is dropped rather than guessed. When the jam's
+  heaviest arrow is dotted, the line above the graph says it *probably* waits
+  for that group.
 - **spawn** — a checkbox. When on, dashed arrows show which group started
   which, from `created by` in the last full dump. Off by default.
 
@@ -146,7 +159,10 @@ group is the jam and what it waits for, which of your groups slept through the
 whole trace. The list page has the same line without the arrows.
 
 **Record trace** records 5 seconds by default, at most once per 10 seconds;
-presses at the same time share one recording. It is the only thing that
+presses at the same time share one recording. A recording too short for the
+full dump below to land inside it is made longer: to 0.2 s + 1.5 × the last
+full dump's time + 0.5 s, rounded up to whole seconds and at most 30 s
+(`traceFor` says how long it ran). It is the only thing that
 traces the target — ruvo never records on its own. While it records, a
 CPU-bound target loses up to about 4% of its throughput (measured on a service
 doing ~40,000 requests per second on one core; a service that mostly waits
@@ -160,12 +176,15 @@ page shows how many (`trace: … · N unknown`). A 5 s trace is about
 6–7 MB at 7,000 requests per second and about 32 MB at 40,000; ruvo reads about
 40 MB/s of it on an Apple M1 Pro and refuses a trace larger than 80 MB. With the
 CLI the trace is parsed in the `ruvo` process. Embedded, everything happens in
-yours: the trace is buffered in memory, up to 80 MB (briefly 2–3 times that
-while the buffer grows), plus a copy of the stacks from the full dump and the
-parsed trace — only while a recording runs.
+yours: while a recording runs, the trace is buffered in memory, up to 80 MB
+(briefly 2–3 times that while the buffer grows), plus a copy of the stacks from
+the full dump and the parsed trace. After it, ruvo keeps the raw trace for
+**Export** until the next recording or until it stops reading the target.
 
 Arrows come from the last recording and stay until the next one or until the
-target restarts. The target must serve `/debug/pprof/trace` (`net/http/pprof`
+target restarts. ruvo notices a restart when a read fails in between and the
+next full dump starts over with low goroutine IDs; point it at one instance,
+not at a load balancer, or what it shows will mix processes. The target must serve `/debug/pprof/trace` (`net/http/pprof`
 does), and its server's write timeout must be longer than the recording.
 
 ## What you see in the list
@@ -175,7 +194,7 @@ does), and its server's write timeout must be longer than the recording.
 | Where they wait | the first frame of your code where a group of goroutines is blocked, and the function they were started with |
 | Goroutines | how many are there now |
 | Waiting | the longest any of them has been waiting (from the last full dump; `—` if the group was not in it) |
-| Growth/min | how fast the group grows over the last two minutes — a steady `+N` is a leak in progress |
+| Growth/min | how fast the group grows over the last two minutes — a steady `+N` is a reason to look for a leak; a pool that grows or a burst of traffic looks the same |
 | Leaked | goroutines that can never wake up, found by the `goroutineleak` profile (press **Find leaks**) |
 | State | `chan receive`, `select`, `IO wait`, `sync.Mutex.Lock`, … |
 
@@ -194,7 +213,7 @@ Under the mount path (`/debug/ruvo/`; the flow page serves the same API under
 |---|---|
 | `GET api/snapshot` | the current snapshot |
 | `GET api/events` | a stream of snapshots (server-sent events, event `snapshot`) |
-| `GET api/events?lean=1` | the same stream, lighter: after a `snapshot`, events `update` carry snapshots whose groups have `stack: null` as long as every group was in the last `snapshot`; take the stacks from it |
+| `GET api/events?lean=1` | the same stream, lighter: after a `snapshot`, events `update` carry `stack` only for groups that are new or whose stack changed since the previous event, and `stack: null` for the rest — take those from the previous event. If the stream missed an event, the next one is a full `snapshot` |
 | `POST api/full` | take a full dump now |
 | `POST api/leaks` | run the `goroutineleak` profile |
 | `POST api/trace?seconds=N` | record a trace for N seconds (1 to 30, default 5); answers 404 unless a view that reads traces, like `flow.View()`, is mounted |

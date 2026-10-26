@@ -18,6 +18,7 @@ type fullState struct {
 	count  int
 	cut    bool
 	raw    []byte
+	cost   time.Duration
 }
 
 type fullGroup struct {

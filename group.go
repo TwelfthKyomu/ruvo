@@ -67,14 +67,18 @@ func groupID(site, entry dump.Frame) string {
 	return fmt.Sprintf("%016x", h.Sum64())
 }
 
-var ownPrefixes = []string{
-	"github.com/TwelfthKyomu/ruvo.(*handler).",
-	"github.com/TwelfthKyomu/ruvo.(*collector).",
-	"github.com/TwelfthKyomu/ruvo.shared[",
-	"github.com/TwelfthKyomu/ruvo/internal/collect.",
-	"runtime/pprof.write",
-	"runtime/trace.(*traceMultiplexer).",
-	"net/http/pprof.Trace",
+var ownPrefixes = ownFuncs(modulePath)
+
+func ownFuncs(pkg string) []string {
+	return []string{
+		pkg + ".(*handler).",
+		pkg + ".(*collector).",
+		pkg + ".shared[",
+		pkg + "/internal/collect.",
+		"runtime/pprof.write",
+		"runtime/trace.(*traceMultiplexer).",
+		"net/http/pprof.Trace",
+	}
 }
 
 func isOwn(frames []dump.Frame) bool {

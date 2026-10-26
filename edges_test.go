@@ -202,8 +202,9 @@ func TestResolveEndpoint(t *testing.T) {
 		{endpoint{id: "x", site: "main.f a.go:1", entry: "main.other"}, "c", false},
 		{endpoint{id: "x", site: "main.g a.go:2", entry: "main.other"}, "c", false},
 		{endpoint{id: "x", site: "main.g a.go:2", entry: "main.mixed", calls: "\x00main.run\x00main.other\x00main.mixed\x00"}, "", false},
-		{endpoint{id: "x", site: "main.z a.go:9", entry: "main.run"}, "b", false},
-		{endpoint{id: "x", site: "main.z a.go:9", entry: "main.tie"}, "d", false},
+		{endpoint{id: "x", site: "main.z a.go:9", entry: "main.run"}, "", false},
+		{endpoint{id: "x", site: "main.z a.go:9", entry: "main.tie"}, "", false},
+		{endpoint{id: "x", site: "main.z a.go:9", entry: "main.top"}, "g", false},
 		{endpoint{id: "x", site: "main.z a.go:9", entry: "main.none"}, "", false},
 		{endpoint{id: "x", site: "main.z a.go:9", entry: "net/http.(*conn).serve"}, "", false},
 		{endpoint{id: "x", site: "main.serve a.go:5", entry: "net/http.(*conn).serve"}, "f", false},
@@ -378,5 +379,47 @@ func TestCaptureTraceCountsUnknownAndUnwoken(t *testing.T) {
 	want := []Edge{{From: CauseNetwork, To: handler, Kind: EdgeUnblock, Count: 1, Waiters: 1, Wait: time.Second}}
 	if !slices.Equal(s.Edges, want) {
 		t.Fatalf("edges %+v, want %+v: goroutines nobody woke are not an edge (worker %s)", s.Edges, want, worker)
+	}
+}
+
+func TestShortTraceLastsUntilTheDump(t *testing.T) {
+	for name, tc := range map[string]struct {
+		cost   time.Duration
+		recent bool
+		ask    time.Duration
+		want   time.Duration
+	}{
+		"slow dump":   {1500 * time.Millisecond, false, time.Second, 3 * time.Second},
+		"fast dump":   {100 * time.Millisecond, false, time.Second, time.Second},
+		"long enough": {1500 * time.Millisecond, false, 5 * time.Second, 5 * time.Second},
+		"no dump":     {1500 * time.Millisecond, true, time.Second, time.Second},
+		"huge dump":   {time.Minute, false, time.Second, traceMax},
+	} {
+		src := newFake(t, "stacks.txt", "full.txt", "")
+		c, clk := newTestCollector(t, src)
+		c.reader = &fakeReader{}
+		c.sample(context.Background(), false)
+
+		clk.set(t0.Add(time.Minute))
+
+		c.mu.Lock()
+		c.full.cost = tc.cost
+		if tc.recent {
+			c.fullTry = attempt{at: c.now()}
+		}
+		c.mu.Unlock()
+
+		s, err := c.captureTrace(context.Background(), tc.ask)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		src.mu.Lock()
+		got := src.traceD
+		src.mu.Unlock()
+
+		if got != tc.want || s.TraceFor != tc.want {
+			t.Errorf("%s: recorded %v, TraceFor %v, want %v", name, got, s.TraceFor, tc.want)
+		}
 	}
 }

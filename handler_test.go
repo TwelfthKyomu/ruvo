@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"runtime/pprof"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -900,8 +901,76 @@ func TestLeanEventsSendStacksOnce(t *testing.T) {
 	})
 	c.sample(context.Background(), false)
 
-	if e := nextEvent(t, events); e.name != "snapshot" || len(e.snap.Groups) != 4 || e.snap.Groups[0].Stack == nil {
-		t.Fatalf("event %q with %d groups: a new group needs a full snapshot", e.name, len(e.snap.Groups))
+	e = nextEvent(t, events)
+	if e.name != "update" || len(e.snap.Groups) != 4 {
+		t.Fatalf("event %q with %d groups, want an update", e.name, len(e.snap.Groups))
+	}
+
+	for _, g := range e.snap.Groups {
+		if fresh := g.Stack != nil; fresh != (g.WaitSite == "main.x a.go:7") {
+			t.Fatalf("group %s at %s: stack sent %v, want it only for the new group", g.ID, g.WaitSite, fresh)
+		}
+	}
+}
+
+func twoPaths(first, second string) []byte {
+	rec := func(n int, path string) string {
+		return fmt.Sprintf("%d @ 0x1 0x2 0x3\n#\t0x1\tmain.wait+0x1\t/home/dev/w.go:10\n#\t0x2\tmain.%s+0x1\t/home/dev/w.go:20\n#\t0x3\tmain.entry+0x1\t/home/dev/w.go:30\n\n", n, path)
+	}
+
+	return []byte("goroutine profile: total 5\n" + rec(3, first) + rec(2, second))
+}
+
+func hasFrame(stack []string, fn string) bool {
+	return slices.ContainsFunc(stack, func(line string) bool { return strings.HasPrefix(line, fn+" ") })
+}
+
+func TestLeanEventsResendChangedStacks(t *testing.T) {
+	src := newFake(t, "", "", "")
+	src.set(func(f *fakeSource) { f.debug1 = twoPaths("pathA", "pathB") })
+	srv, c := serve(t, src)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, srv.URL+"/api/events?lean=1", nil)
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	defer resp.Body.Close()
+
+	events := readNamedEvents(t, resp.Body)
+
+	first := nextEvent(t, events)
+	if first.name != "snapshot" || len(first.snap.Groups) != 1 || !hasFrame(first.snap.Groups[0].Stack, "main.pathA") {
+		t.Fatalf("first event %q: %+v", first.name, first.snap.Groups)
+	}
+
+	id := first.snap.Groups[0].ID
+
+	src.set(func(f *fakeSource) { f.debug1 = twoPaths("pathB", "pathA") })
+	c.sample(context.Background(), false)
+
+	e := nextEvent(t, events)
+	if e.name != "update" || len(e.snap.Groups) != 1 || e.snap.Groups[0].ID != id {
+		t.Fatalf("event %q: %+v, want an update of group %s", e.name, e.snap.Groups, id)
+	}
+
+	if !hasFrame(e.snap.Groups[0].Stack, "main.pathB") {
+		t.Fatalf("stack %q: the group kept its ID but its stack changed, the update must carry it", e.snap.Groups[0].Stack)
+	}
+
+	c.mu.Lock()
+	next := c.last
+	next.Seq++
+	c.broadcastLocked(Snapshot{Seq: next.Seq - 2}, next)
+	c.mu.Unlock()
+
+	if e := nextEvent(t, events); e.name != "snapshot" || !hasFrame(e.snap.Groups[0].Stack, "main.pathB") {
+		t.Fatalf("event %q: a message that follows one the stream did not get must be a full snapshot", e.name)
 	}
 }
 
