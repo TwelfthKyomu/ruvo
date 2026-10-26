@@ -2,4 +2,7 @@ module github.com/TwelfthKyomu/ruvo
 
 go 1.27
 
-retract v0.1.0 // Published by mistake with files that were not meant to be public.
+retract (
+	[v0.1.1, v0.4.0] // Shows wrong data in some cases; use v0.5.0 or later.
+	v0.1.0 // Published by mistake with files that were not meant to be public.
+)
