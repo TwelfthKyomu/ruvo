@@ -444,8 +444,18 @@
         for (const f of g.stack || []) ul.append(el("li", "", f));
         td.append(ul);
         if (g.createdBy) td.append(el("div", "created", "created by " + g.createdBy));
+        if (g.labels && g.labels.length) {
+            td.append(el("div", "created", "by pprof labels"));
+            const lu = el("ul", "stack");
+            for (const l of g.labels) lu.append(el("li", "", labelText(l)));
+            td.append(lu);
+        }
         tr.append(td);
         return tr;
+    }
+
+    function labelText(l) {
+        return Object.keys(l.labels).sort().map((k) => k + "=" + l.labels[k]).join(" ") + " ×" + l.count;
     }
 
     function show(s) {
@@ -472,15 +482,29 @@
         }
     }
 
+    let stacks = new Map();
+
+    function remember(s) {
+        stacks = new Map((s.groups || []).map((g) => [g.id, g.stack]));
+        return s;
+    }
+
+    function fill(s) {
+        for (const g of s.groups || []) g.stack = stacks.get(g.id) || [];
+        return s;
+    }
+
     function connect() {
-        const es = new EventSource("api/events");
-        es.addEventListener("snapshot", (e) => {
+        const es = new EventSource("api/events?lean=1");
+        const got = (s) => {
             if (poller) {
                 clearInterval(poller);
                 poller = null;
             }
-            show(JSON.parse(e.data));
-        });
+            show(s);
+        };
+        es.addEventListener("snapshot", (e) => got(remember(JSON.parse(e.data))));
+        es.addEventListener("update", (e) => got(fill(JSON.parse(e.data))));
         es.onerror = () => {
             disconnected();
             if (!poller) poller = setInterval(poll, 5000);

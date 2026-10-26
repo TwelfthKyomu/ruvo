@@ -293,3 +293,32 @@ func (c *counter) Write(p []byte) (int, error) {
 
 	return len(p), nil
 }
+
+func BenchmarkEncode(b *testing.B) {
+	c := newCollector(collect.Local())
+	defer c.close()
+
+	p, err := dump.ParseStacks(manyStacks(1000, 20))
+	if err != nil {
+		b.Fatal(err)
+	}
+
+	c.mu.Lock()
+	c.profile = p
+	s := c.publishLocked(t0, false, "")
+	c.mu.Unlock()
+
+	for name, enc := range map[string]func(message) []byte{"full": message.full, "lean": message.lean} {
+		b.Run(name, func(b *testing.B) {
+			b.ReportAllocs()
+
+			var size int
+
+			for b.Loop() {
+				size = len(enc(newMessage(s)))
+			}
+
+			b.ReportMetric(float64(size)/1024, "KB/event")
+		})
+	}
+}

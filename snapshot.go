@@ -59,6 +59,10 @@ type Group struct {
 	// change of less than one goroutine over that span counts as zero.
 	Growth float64 `json:"growthPerMin"`
 	Leaked int     `json:"leaked"`
+	// Labels breaks Count down by the pprof labels of the goroutines, most
+	// common first and at most 10 sets; goroutines without labels are not
+	// counted. Labels come from code that calls pprof.Do or SetGoroutineLabels.
+	Labels []LabelCount `json:"labels,omitempty"`
 	// Unwoken is how many goroutines of the group waited through the whole
 	// last trace: nothing woke them while it ran.
 	Unwoken int      `json:"unwoken,omitempty"`
@@ -66,6 +70,12 @@ type Group struct {
 	// Std reports that the group waits in the standard library, with no code
 	// of yours on the stack.
 	Std bool `json:"std,omitempty"`
+}
+
+// LabelCount is how many goroutines of a group carry one set of pprof labels.
+type LabelCount struct {
+	Labels map[string]string `json:"labels"`
+	Count  int               `json:"count"`
 }
 
 // EdgeKind says how two groups are related.

@@ -9,6 +9,7 @@ import (
 type Record struct {
 	Count  int
 	Frames []Frame
+	Labels string
 }
 
 type Profile struct {
@@ -65,7 +66,13 @@ func (in *Strings) ParseStacks(data []byte) (Profile, error) {
 			flush()
 			cur = -1
 		case line[0] == '#':
-			if cur < 0 || bytes.HasPrefix(line, []byte("# labels:")) {
+			if cur < 0 {
+				continue
+			}
+
+			if l, ok := bytes.CutPrefix(line, []byte("# labels:")); ok {
+				p.Records[cur].Labels = strs.str(bytes.TrimSpace(l))
+
 				continue
 			}
 

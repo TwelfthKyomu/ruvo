@@ -1,8 +1,11 @@
 package ruvo
 
 import (
+	"cmp"
 	"fmt"
 	"hash/fnv"
+	"maps"
+	"slices"
 	"strconv"
 	"strings"
 
@@ -102,8 +105,9 @@ type stackGroup struct {
 }
 
 type groupCache struct {
-	m   map[string]stackGroup
-	key []byte
+	m      map[string]stackGroup
+	key    []byte
+	labels map[string]map[string]string
 }
 
 func buildGroups(p dump.Profile) (map[string]*Group, int) {
@@ -114,6 +118,7 @@ func buildGroups(p dump.Profile) (map[string]*Group, int) {
 
 func (gc *groupCache) build(p dump.Profile) (map[string]*Group, int) {
 	groups := map[string]*Group{}
+	labeled := map[string]map[string]int{}
 	total := 0
 
 	for _, r := range p.Records {
@@ -135,9 +140,111 @@ func (gc *groupCache) build(p dump.Profile) (map[string]*Group, int) {
 		}
 
 		g.Count += r.Count
+
+		if r.Labels != "" {
+			if labeled[sg.id] == nil {
+				labeled[sg.id] = map[string]int{}
+			}
+
+			labeled[sg.id][r.Labels] += r.Count
+		}
+	}
+
+	for id, counts := range labeled {
+		groups[id].Labels = gc.topLabels(counts)
 	}
 
 	return groups, total
+}
+
+const (
+	labelSetsMax  = 10
+	labelCacheMax = 10_000
+)
+
+func (gc *groupCache) topLabels(counts map[string]int) []LabelCount {
+	texts := slices.SortedFunc(maps.Keys(counts), func(a, b string) int {
+		return cmp.Or(cmp.Compare(counts[b], counts[a]), strings.Compare(a, b))
+	})
+
+	out := make([]LabelCount, 0, min(len(texts), labelSetsMax))
+
+	for _, text := range texts {
+		if len(out) == labelSetsMax {
+			break
+		}
+
+		if set := gc.labelSet(text); set != nil {
+			out = append(out, LabelCount{Labels: set, Count: counts[text]})
+		}
+	}
+
+	return out
+}
+
+func (gc *groupCache) labelSet(text string) map[string]string {
+	if set, ok := gc.labels[text]; ok {
+		return set
+	}
+
+	set := parseLabels(text)
+
+	if gc.labels == nil || len(gc.labels) >= labelCacheMax {
+		gc.labels = map[string]map[string]string{}
+	}
+
+	gc.labels[text] = set
+
+	return set
+}
+
+func parseLabels(text string) map[string]string {
+	s, ok := strings.CutPrefix(text, "{")
+	if !ok {
+		return nil
+	}
+
+	if s, ok = strings.CutSuffix(s, "}"); !ok {
+		return nil
+	}
+
+	set := map[string]string{}
+
+	for s != "" {
+		k, rest, ok := unquotePrefix(s)
+		if !ok {
+			return nil
+		}
+
+		if rest, ok = strings.CutPrefix(rest, ":"); !ok {
+			return nil
+		}
+
+		v, rest, ok := unquotePrefix(rest)
+		if !ok {
+			return nil
+		}
+
+		set[k] = v
+		s = strings.TrimPrefix(rest, ", ")
+	}
+
+	if len(set) == 0 {
+		return nil
+	}
+
+	return set
+}
+
+func unquotePrefix(s string) (string, string, bool) {
+	q, err := strconv.QuotedPrefix(s)
+	if err != nil {
+		return "", "", false
+	}
+
+	v, err := strconv.Unquote(q)
+
+	return v, s[len(q):], err == nil
 }
 
 func (gc *groupCache) lookup(frames []dump.Frame) stackGroup {

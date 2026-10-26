@@ -2,6 +2,7 @@ package ruvo
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -9,7 +10,9 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"runtime/pprof"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -797,4 +800,174 @@ func TestTraceEndpointErrors(t *testing.T) {
 	if code, body, _ := call(t, http.MethodPost, srv.URL+"/api/trace"); code != http.StatusBadGateway || !strings.Contains(body, "read trace: bad header") {
 		t.Fatalf("reader error: status %d, body %q", code, body)
 	}
+}
+
+type sseEvent struct {
+	name string
+	snap Snapshot
+}
+
+func readNamedEvents(t *testing.T, body io.Reader) <-chan sseEvent {
+	t.Helper()
+
+	out := make(chan sseEvent, 16)
+
+	go func() {
+		defer close(out)
+
+		sc := bufio.NewScanner(body)
+		sc.Buffer(make([]byte, 64*1024), 8<<20)
+
+		name := ""
+
+		for sc.Scan() {
+			line := sc.Text()
+
+			if v, ok := strings.CutPrefix(line, "event: "); ok {
+				name = v
+			}
+
+			if v, ok := strings.CutPrefix(line, "data: "); ok {
+				var s Snapshot
+
+				if err := json.Unmarshal([]byte(v), &s); err != nil {
+					return
+				}
+
+				out <- sseEvent{name: name, snap: s}
+			}
+		}
+	}()
+
+	return out
+}
+
+func nextEvent(t *testing.T, events <-chan sseEvent) sseEvent {
+	t.Helper()
+
+	select {
+	case e, ok := <-events:
+		if !ok {
+			t.Fatal("stream closed")
+		}
+
+		return e
+	case <-time.After(2 * time.Second):
+		t.Fatal("no event")
+	}
+
+	return sseEvent{}
+}
+
+func TestLeanEventsSendStacksOnce(t *testing.T) {
+	src := newFake(t, "stacks.txt", "", "")
+	srv, c := serve(t, src)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, srv.URL+"/api/events?lean=1", nil)
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	defer resp.Body.Close()
+
+	events := readNamedEvents(t, resp.Body)
+
+	if e := nextEvent(t, events); e.name != "snapshot" || len(e.snap.Groups) != 3 || e.snap.Groups[0].Stack == nil {
+		t.Fatalf("first event %q with %d groups: it must carry the stacks", e.name, len(e.snap.Groups))
+	}
+
+	c.sample(context.Background(), false)
+
+	e := nextEvent(t, events)
+	if e.name != "update" || len(e.snap.Groups) != 3 {
+		t.Fatalf("event %q with %d groups, want an update", e.name, len(e.snap.Groups))
+	}
+
+	for _, g := range e.snap.Groups {
+		if g.Stack != nil {
+			t.Fatalf("group %s repeats its stack in an update", g.ID)
+		}
+	}
+
+	src.set(func(f *fakeSource) {
+		extra := stacksText(2)[len("goroutine profile: total 2\n"):]
+		f.debug1 = append(bytes.Replace(f.debug1, []byte("total 26"), []byte("total 28"), 1), extra...)
+	})
+	c.sample(context.Background(), false)
+
+	if e := nextEvent(t, events); e.name != "snapshot" || len(e.snap.Groups) != 4 || e.snap.Groups[0].Stack == nil {
+		t.Fatalf("event %q with %d groups: a new group needs a full snapshot", e.name, len(e.snap.Groups))
+	}
+}
+
+func TestPlainEventsKeepStacks(t *testing.T) {
+	src := newFake(t, "stacks.txt", "", "")
+	srv, c := serve(t, src)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, srv.URL+"/api/events", nil)
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	defer resp.Body.Close()
+
+	events := readNamedEvents(t, resp.Body)
+	nextEvent(t, events)
+	c.sample(context.Background(), false)
+
+	if e := nextEvent(t, events); e.name != "snapshot" || e.snap.Groups[0].Stack == nil {
+		t.Fatalf("event %q: without lean=1 every event is a full snapshot", e.name)
+	}
+}
+
+func TestLocalHandlerSeesLabels(t *testing.T) {
+	ch := make(chan struct{})
+	defer close(ch)
+
+	var started sync.WaitGroup
+
+	for range 4 {
+		started.Add(1)
+
+		go pprof.Do(context.Background(), pprof.Labels("job", "seven"), func(context.Context) {
+			started.Done()
+			parked(ch)
+		})
+	}
+
+	started.Wait()
+
+	h := Handler().(*handler)
+	t.Cleanup(h.c.close)
+
+	srv := httptest.NewServer(h)
+	defer srv.Close()
+
+	_, body, _ := call(t, http.MethodGet, srv.URL+"/api/snapshot")
+
+	var s Snapshot
+
+	if err := json.Unmarshal([]byte(body), &s); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, g := range s.Groups {
+		for _, l := range g.Labels {
+			if l.Labels["job"] == "seven" && l.Count >= 4 {
+				return
+			}
+		}
+	}
+
+	t.Fatalf("no group with 4 goroutines labeled job=seven in %d groups", len(s.Groups))
 }

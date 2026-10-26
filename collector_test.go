@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/TwelfthKyomu/ruvo/internal/collect"
+	"github.com/TwelfthKyomu/ruvo/internal/dump"
 )
 
 func groupByEntry(s Snapshot, entry string) (Group, bool) {
@@ -1198,5 +1199,45 @@ func TestSeqGrowsWithinOneInstant(t *testing.T) {
 
 	if !a.At.Equal(b.At) || !(a.Seq < b.Seq && b.Seq < e.Seq) || a.Seq < t0.UnixMicro() {
 		t.Fatalf("seq %d, %d, %d at %v, %v: snapshots of one instant must still be ordered", a.Seq, b.Seq, e.Seq, a.At, b.At)
+	}
+}
+
+func TestUnchangedStacksAreParsedOnce(t *testing.T) {
+	src := newFake(t, "stacks.txt", "", "")
+	c, _ := newTestCollector(t, src)
+
+	records := func() *dump.Record {
+		c.mu.Lock()
+		defer c.mu.Unlock()
+
+		return &c.profile.Records[0]
+	}
+
+	c.sample(context.Background(), false)
+	first := records()
+
+	c.sample(context.Background(), false)
+
+	if records() != first {
+		t.Fatal("the same debug=1 text was parsed again")
+	}
+
+	src.set(func(f *fakeSource) { f.debug1 = stacksText(4) })
+	c.sample(context.Background(), false)
+
+	if records() == first {
+		t.Fatal("a changed debug=1 text was not parsed")
+	}
+
+	c.mu.Lock()
+	c.stopLocked()
+	c.mu.Unlock()
+
+	c.pmu.Lock()
+	kept := c.parsed != nil
+	c.pmu.Unlock()
+
+	if kept {
+		t.Fatal("the last debug=1 text is kept after the collector stopped")
 	}
 }

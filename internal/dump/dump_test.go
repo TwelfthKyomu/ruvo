@@ -40,6 +40,10 @@ func TestParseStacks(t *testing.T) {
 		t.Fatalf("entry %q", got)
 	}
 
+	if p.Records[2].Labels != `{"media_job":"42"}` || p.Records[0].Labels != "" {
+		t.Fatalf("labels %q, %q", p.Records[2].Labels, p.Records[0].Labels)
+	}
+
 	wantLast := []Frame{
 		{"main.(*pipeline).handleWork", "/home/dev/leaky/pipeline.go", 145},
 		{"net/http.(*conn).serve", "/usr/local/go/src/net/http/server.go", 2157},

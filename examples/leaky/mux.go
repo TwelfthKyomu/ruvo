@@ -1,14 +1,16 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"net/http"
 	"net/http/pprof"
+	rpprof "runtime/pprof"
 )
 
 func newMux(p *pipeline) *http.ServeMux {
 	mux := http.NewServeMux()
-	mux.HandleFunc("/work", p.handleWork)
+	mux.Handle("/work", labeled(p, http.HandlerFunc(p.handleWork)))
 	mux.HandleFunc("/break", p.handleBreak)
 	mux.HandleFunc("/upstream", handleUpstream)
 	mux.HandleFunc("/debug/pprof/", pprof.Index)
@@ -32,4 +34,14 @@ func (p *pipeline) handleBreak(w http.ResponseWriter, r *http.Request) {
 	}
 
 	fmt.Fprintln(w, p.currentMode())
+}
+
+func labeled(p *pipeline, h http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		labels := rpprof.Labels("route", r.URL.Path, "mode", string(p.currentMode()))
+
+		rpprof.Do(r.Context(), labels, func(ctx context.Context) {
+			h.ServeHTTP(w, r.WithContext(ctx))
+		})
+	})
 }

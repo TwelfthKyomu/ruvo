@@ -219,15 +219,22 @@ func (h *handler) serveEvents(w http.ResponseWriter, r *http.Request) {
 	}
 
 	rc := http.NewResponseController(w)
+	lean := r.URL.Query().Get("lean") == "1"
 
 	ch, cancel := h.c.subscribe()
 	defer cancel()
 
 	s := h.c.snapshot(r.Context())
 
-	first, err := json.Marshal(s)
-	if err != nil || send(rc, h.writeTimeout, func() error { return writeEvent(w, first) }) != nil {
+	first := encodeJSON(s)
+	if first == nil || send(rc, h.writeTimeout, func() error { return writeEvent(w, "snapshot", first) }) != nil {
 		return
+	}
+
+	var known map[string]bool
+
+	if lean {
+		known = groupIDSet(s)
 	}
 
 	last := s.Seq
@@ -246,7 +253,17 @@ func (h *handler) serveEvents(w http.ResponseWriter, r *http.Request) {
 			}
 
 			last = m.s.Seq
-			write = func() error { return writeEvent(w, m.data) }
+
+			switch {
+			case lean && coversGroups(known, m.s):
+				write = func() error { return writeEvent(w, "update", m.lean()) }
+			case lean:
+				known = groupIDSet(m.s)
+
+				fallthrough
+			default:
+				write = func() error { return writeEvent(w, "snapshot", m.full()) }
+			}
 		case <-tick.C:
 			write = func() error { return writePing(w) }
 		}
@@ -287,10 +304,30 @@ func writePing(w io.Writer) error {
 	return err
 }
 
-func writeEvent(w io.Writer, data []byte) error {
-	_, err := fmt.Fprintf(w, "event: snapshot\ndata: %s\n\n", data)
+func writeEvent(w io.Writer, name string, data []byte) error {
+	_, err := fmt.Fprintf(w, "event: %s\ndata: %s\n\n", name, data)
 
 	return err
+}
+
+func groupIDSet(s Snapshot) map[string]bool {
+	ids := make(map[string]bool, len(s.Groups))
+
+	for _, g := range s.Groups {
+		ids[g.ID] = true
+	}
+
+	return ids
+}
+
+func coversGroups(known map[string]bool, s Snapshot) bool {
+	for _, g := range s.Groups {
+		if !known[g.ID] {
+			return false
+		}
+	}
+
+	return true
 }
 
 func writeJSON(w http.ResponseWriter, s Snapshot) {

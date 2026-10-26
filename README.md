@@ -156,7 +156,11 @@ does), and its server's write timeout must be longer than the recording.
 | Leaked | goroutines that can never wake up, found by the `goroutineleak` profile (press **Find leaks**) |
 | State | `chan receive`, `select`, `IO wait`, `sync.Mutex.Lock`, … |
 
-Click a row to see its stack and where the goroutines were created.
+Click a row to see its stack, where the goroutines were created and, if your
+code sets [pprof labels](https://pkg.go.dev/runtime/pprof#Do), how the group
+splits by them: `route=/work tenant=acme ×31` says which requests left those
+goroutines there. ruvo reads the labels from the same `debug=1` profile, at no
+extra cost to the target; the flow page shows them in the node panel.
 
 ## API
 
@@ -167,6 +171,7 @@ Under the mount path (`/debug/ruvo/`; the flow page serves the same API under
 |---|---|
 | `GET api/snapshot` | the current snapshot |
 | `GET api/events` | a stream of snapshots (server-sent events, event `snapshot`) |
+| `GET api/events?lean=1` | the same stream, lighter: after a `snapshot`, events `update` carry snapshots whose groups have `stack: null` as long as every group was in the last `snapshot`; take the stacks from it |
 | `POST api/full` | take a full dump now |
 | `POST api/leaks` | run the `goroutineleak` profile |
 | `POST api/trace?seconds=N` | record a trace for N seconds (1 to 30, default 5); answers 404 unless a view that reads traces, like `flow.View()`, is mounted |
@@ -185,7 +190,7 @@ snapshot has:
 | `traceUnknown` | how many wakeups of that trace have no edge because it is not known where the woken goroutines waited |
 | `error` | set when the last read of the target failed; the data is the last good one |
 | `offline` | the snapshot comes from a session file: nothing reads the target, and the POSTs answer 409 |
-| `groups` | `id`, `waitSite`, `entry`, `createdBy`, `state`, `count`, `maxWait`, `inFullDump`, `growthPerMin`, `leaked`, `unwoken` (waited through the whole last trace), `stack`, `std` (no code of yours on the stack) |
+| `groups` | `id`, `waitSite`, `entry`, `createdBy`, `state`, `count`, `maxWait`, `inFullDump`, `growthPerMin`, `leaked`, `unwoken` (waited through the whole last trace), `labels` (up to 10 pprof label sets with their counts), `stack`, `std` (no code of yours on the stack) |
 | `edges` | `from`, `to`, `kind` (`unblock` or `spawn`), `count`, `approx` (an end was matched to a current group by wait site or start function), and for `unblock` also `wait` (total time the woken goroutines waited) and `waiters`; `from` is a group id, or `network` or `timer` |
 
 ## How it stays cheap
@@ -239,8 +244,11 @@ what a full dump allocates is the dump text itself. A remote target serves the d
 buffer.
 
 Publishing a snapshot of 1,000 groups with 20-frame stacks — parsing, groups,
-growth, arrows and the JSON for the page — takes about 7 ms
-(`go test -bench BenchmarkPublish`). Recording a trace has its own cost, described under
+growth and arrows — takes about 5 ms (`go test -bench BenchmarkPublish`); a
+`debug=1` profile that has not changed since the last read is not parsed
+again. The pages get stacks only when a group first appears: their usual event
+is 258 KB instead of 1.8 MB and takes 0.5 ms to encode instead of 2 ms
+(`BenchmarkEncode`), once per snapshot however many pages are open. Recording a trace has its own cost, described under
 [Who wakes whom](#who-wakes-whom).
 
 ## Try it

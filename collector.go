@@ -28,7 +28,6 @@ type collector struct {
 	mu          sync.Mutex
 	hist        history
 	groups      groupCache
-	enc         bytes.Buffer
 	full        fullState
 	leaks       leakState
 	trace       traceState
@@ -62,13 +61,69 @@ type collector struct {
 	fmu     sync.Mutex
 	flights map[string]*flight
 
-	pmu  sync.Mutex
-	strs dump.Strings
+	pmu           sync.Mutex
+	strs          dump.Strings
+	parsed        []byte
+	parsedProfile dump.Profile
 }
 
 type message struct {
-	s    Snapshot
-	data []byte
+	s   Snapshot
+	enc *encoded
+}
+
+type encoded struct {
+	fullOnce sync.Once
+	leanOnce sync.Once
+	full     []byte
+	lean     []byte
+}
+
+func newMessage(s Snapshot) message {
+	return message{s: s, enc: &encoded{}}
+}
+
+func (m message) full() []byte {
+	m.enc.fullOnce.Do(func() { m.enc.full = encodeJSON(m.s) })
+
+	return m.enc.full
+}
+
+func (m message) lean() []byte {
+	m.enc.leanOnce.Do(func() { m.enc.lean = encodeJSON(leanSnapshot(m.s)) })
+
+	return m.enc.lean
+}
+
+func leanSnapshot(s Snapshot) Snapshot {
+	groups := slices.Clone(s.Groups)
+
+	for i := range groups {
+		groups[i].Stack = nil
+	}
+
+	s.Groups = groups
+
+	return s
+}
+
+var encoders = sync.Pool{New: func() any { return new(bytes.Buffer) }}
+
+func encodeJSON(v any) []byte {
+	b := encoders.Get().(*bytes.Buffer)
+	b.Reset()
+
+	defer func() {
+		if b.Cap() <= 16<<20 {
+			encoders.Put(b)
+		}
+	}()
+
+	if err := json.NewEncoder(b).Encode(v); err != nil {
+		return nil
+	}
+
+	return bytes.Clone(bytes.TrimSuffix(b.Bytes(), []byte("\n")))
 }
 
 type flight struct {
@@ -550,6 +605,10 @@ func (c *collector) stopLocked() {
 	c.leaks.raw = nil
 	c.trace.raw = nil
 	c.trace.dump = nil
+
+	c.pmu.Lock()
+	c.parsed, c.parsedProfile = nil, dump.Profile{}
+	c.pmu.Unlock()
 }
 
 func (c *collector) idleLocked(now time.Time) bool {
@@ -609,7 +668,14 @@ func (c *collector) fetchStacks(ctx context.Context) (dump.Profile, []byte, time
 	c.pmu.Lock()
 	defer c.pmu.Unlock()
 
+	if c.parsed != nil && bytes.Equal(raw, c.parsed) {
+		return c.parsedProfile, raw, time.Since(start), nil
+	}
+
 	p, err := c.strs.ParseStacks(raw)
+	if err == nil {
+		c.parsed, c.parsedProfile = raw, p
+	}
 
 	return p, raw, time.Since(start), err
 }
@@ -755,13 +821,7 @@ func (c *collector) broadcastLocked(s Snapshot) {
 		return
 	}
 
-	c.enc.Reset()
-
-	if err := json.NewEncoder(&c.enc).Encode(s); err != nil {
-		return
-	}
-
-	m := message{s: s, data: bytes.Clone(bytes.TrimSuffix(c.enc.Bytes(), []byte("\n")))}
+	m := newMessage(s)
 
 	for ch := range c.subs {
 		select {

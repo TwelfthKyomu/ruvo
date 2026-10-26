@@ -601,6 +601,8 @@
             <ul class="links" id="wokenBy"></ul>
             <h3>Wakes</h3>
             <ul class="links" id="wakes"></ul>
+            <h3 id="labelsHead" hidden>By pprof labels</h3>
+            <ul class="stack" id="labels" hidden></ul>
             <h3>Stack</h3>
             <ul class="stack" id="stack"></ul>
         </aside>
@@ -1240,6 +1242,14 @@
         const ul = $("stack");
         ul.replaceChildren();
         for (const f of g.stack || []) ul.append(el("li", "", f));
+        const lu = $("labels");
+        lu.replaceChildren();
+        for (const l of g.labels || []) lu.append(el("li", "", labelText(l)));
+        lu.hidden = $("labelsHead").hidden = !(g.labels && g.labels.length);
+    }
+
+    function labelText(l) {
+        return Object.keys(l.labels).sort().map((k) => k + "=" + l.labels[k]).join(" ") + " ×" + l.count;
     }
 
     function banner() {
@@ -1309,15 +1319,29 @@
         }
     }
 
+    let stacks = new Map();
+
+    function remember(s) {
+        stacks = new Map((s.groups || []).map((g) => [g.id, g.stack]));
+        return s;
+    }
+
+    function fill(s) {
+        for (const g of s.groups || []) g.stack = stacks.get(g.id) || [];
+        return s;
+    }
+
     function connect() {
-        const es = new EventSource("api/events");
-        es.addEventListener("snapshot", (e) => {
+        const es = new EventSource("api/events?lean=1");
+        const got = (s) => {
             if (poller) {
                 clearInterval(poller);
                 poller = null;
             }
-            show(JSON.parse(e.data));
-        });
+            show(s);
+        };
+        es.addEventListener("snapshot", (e) => got(remember(JSON.parse(e.data))));
+        es.addEventListener("update", (e) => got(fill(JSON.parse(e.data))));
         es.onerror = () => {
             disconnected();
             if (!poller) poller = setInterval(poll, 5000);

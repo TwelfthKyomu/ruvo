@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
+	"maps"
 	"os"
 	"runtime/trace"
 	"strings"
@@ -270,5 +272,50 @@ func TestLocalTraceReaderHidden(t *testing.T) {
 				t.Fatalf("the trace reader goroutine is in group %s: %v", g.WaitSite, g.Stack)
 			}
 		}
+	}
+}
+
+func TestParseLabels(t *testing.T) {
+	for text, want := range map[string]map[string]string{
+		`{"job":"7"}`:                 {"job": "7"},
+		`{"a":"1", "b":"x y"}`:        {"a": "1", "b": "x y"},
+		`{"k":"say \"hi\"", "z":"é"}`: {"k": `say "hi"`, "z": "é"},
+		`{}`:                          nil,
+		`{"a":1}`:                     nil,
+		`"a":"1"`:                     nil,
+		`{"a" "1"}`:                   nil,
+	} {
+		if got := parseLabels(text); !maps.Equal(got, want) || (got == nil) != (want == nil) {
+			t.Errorf("parseLabels(%s) = %v, want %v", text, got, want)
+		}
+	}
+}
+
+func TestGroupLabels(t *testing.T) {
+	frames := []dump.Frame{{Func: "main.wait", File: "/home/dev/a.go", Line: 7}}
+
+	records := []dump.Record{
+		{Count: 3, Frames: frames, Labels: `{"job":"a"}`},
+		{Count: 2, Frames: frames},
+		{Count: 1, Frames: frames, Labels: `{"job":"b"}`},
+	}
+
+	for i := range 12 {
+		records = append(records, dump.Record{Count: 1, Frames: frames, Labels: fmt.Sprintf(`{"req":"%02d"}`, i)})
+	}
+
+	groups, total := buildGroups(dump.Profile{Total: 18, Records: records})
+
+	var g *Group
+	for _, v := range groups {
+		g = v
+	}
+
+	if total != 18 || len(groups) != 1 || g.Count != 18 {
+		t.Fatalf("total %d, %d groups", total, len(groups))
+	}
+
+	if len(g.Labels) != 10 || g.Labels[0].Count != 3 || g.Labels[0].Labels["job"] != "a" || g.Labels[1].Labels["job"] != "b" || g.Labels[2].Labels["req"] != "00" {
+		t.Fatalf("labels %+v", g.Labels)
 	}
 }
