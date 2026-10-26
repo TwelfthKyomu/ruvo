@@ -1,7 +1,7 @@
-github.com/TwelfthKyomu/ruvo v0.3.0 h1:t/ITbxNN+KcLW94RDCggDRqRYdlYwdhkNdklDUWMR2o=
-github.com/TwelfthKyomu/ruvo v0.3.0/go.mod h1:fUC18/hCz8lgl91Ycat/wyfca5pUO0pTRsTDw++clRg=
-github.com/TwelfthKyomu/ruvo/flow v0.3.0 h1:XvBe6cTsSggDWE9yVMo0WBJ0X3k23/N27JbtCTo2ies=
-github.com/TwelfthKyomu/ruvo/flow v0.3.0/go.mod h1:m/oQqqv0K3dwnWDozpYFGnZT8LZxefx2IZ3runhSdn4=
+github.com/TwelfthKyomu/ruvo v0.3.1 h1:XCvd1t23LSOHsm2bu3Tb7vLR/mSQThuOxBoEl9i74NM=
+github.com/TwelfthKyomu/ruvo v0.3.1/go.mod h1:fUC18/hCz8lgl91Ycat/wyfca5pUO0pTRsTDw++clRg=
+github.com/TwelfthKyomu/ruvo/flow v0.3.1 h1:ZYSC4q5BynzzGdr4yvQ7EAC4I6CDxY78bsSGsDGHN/g=
+github.com/TwelfthKyomu/ruvo/flow v0.3.1/go.mod h1:KzXFOz54h5i/LvcV8/niRTUUY7P4OUAMP4oQyfidCMs=
 golang.org/x/exp v0.0.0-20261014143641-f0251eb4aa3e h1:HgI6W1OolKK6tcV74is+rl9SMT0njsHlp0TbQiGXI/A=
 golang.org/x/exp v0.0.0-20261014143641-f0251eb4aa3e/go.mod h1:DBoxwWhjaW8DJJw/YeM4zpeOKMC1FMXSblsYy+1mFSw=
 golang.org/x/tools v0.52.0 h1:ryxg4U63oaUYk7uOLTF37n43f4qgtGvqV4Ioit1BaEs=
