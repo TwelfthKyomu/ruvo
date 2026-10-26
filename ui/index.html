@@ -139,6 +139,15 @@
             display: block;
         }
 
+        .summary {
+            margin: 0 0 12px;
+            padding: 10px 14px;
+            border: 1px solid var(--line);
+            border-radius: 8px;
+            background: var(--panel);
+            overflow-wrap: anywhere;
+        }
+
         a.button {
             font: inherit;
             padding: 4px 10px;
@@ -291,6 +300,7 @@
 </header>
 <div class="banner" id="banner"></div>
 <main>
+    <p class="summary" id="summary" hidden></p>
     <div class="wrap">
         <table>
             <thead>
@@ -392,8 +402,32 @@
         document.title = "ruvo · " + snap.target;
     }
 
+    function summary() {
+        const groups = (snap && snap.groups) || [];
+        const most = (key, mine) => groups.filter((g) => g[key] > 0 && (!mine || !g.std)).sort((a, b) => b[key] - a[key])[0];
+        const rate = (v) => "+" + (Math.abs(v) >= 10 ? Math.round(Math.abs(v)) : Math.abs(v).toFixed(1)) + "/min";
+        const out = [];
+        const told = new Set();
+        const leaked = most("leaked");
+        if (leaked) {
+            out.push(leaked.waitSite + ": " + count(leaked.leaked) + " goroutines blocked forever" + (leaked.growthPerMin > 0 ? ", growing " + rate(leaked.growthPerMin) : "") + ".");
+            told.add(leaked.id);
+        }
+        const growing = most("growthPerMin");
+        if (growing && !told.has(growing.id)) {
+            out.push(growing.waitSite + " grows " + rate(growing.growthPerMin) + ".");
+            told.add(growing.id);
+        }
+        const stuck = most("unwoken", true);
+        if (stuck && !told.has(stuck.id)) out.push(stuck.waitSite + ": " + count(stuck.unwoken) + " goroutines slept through the whole trace — nothing woke them.");
+        return out.join(" ");
+    }
+
     function render() {
         header();
+        const text = summary();
+        $("summary").textContent = text;
+        $("summary").hidden = !text;
         const body = $("rows");
         const focused = document.activeElement;
         const keep = focused && body.contains(focused) ? focused.dataset.id : null;

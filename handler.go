@@ -146,6 +146,8 @@ func (h *handler) serveAPI(w http.ResponseWriter, r *http.Request, rel string) {
 		h.serveAction(w, r, h.captureTrace)
 	case "/api/export":
 		h.serveExport(w, r)
+	case "/api/metrics":
+		h.serveMetrics(w, r)
 	default:
 		http.NotFound(w, r)
 	}

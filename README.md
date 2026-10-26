@@ -58,6 +58,25 @@ The list is at `/debug/ruvo/` and the flow page at `/debug/ruvo/flow/`
 Mount it only on a listener you control, like `net/http/pprof`: the page shows
 every goroutine stack and can trigger full dumps and traces.
 
+## Keep the numbers in Prometheus
+
+`GET api/metrics` serves the snapshot in the Prometheus text format: whether
+the target answers, how many goroutines and groups it has, and for the 200
+largest groups their size, growth per minute and, after **Find leaks**, the
+leaked count, labelled by `id`, `site` and `entry`; plus when the last full
+dump, leak search and trace ran.
+
+```yaml
+scrape_configs:
+  - job_name: ruvo
+    metrics_path: /api/metrics          # /debug/ruvo/api/metrics when embedded
+    static_configs:
+      - targets: ["localhost:7070"]
+```
+
+Each scrape counts as someone watching: ruvo keeps reading the target, on the
+same budget as with the page open.
+
 ## Save it and show a colleague
 
 **Export** on either page saves a zip file: what the page shows, plus the raw
@@ -122,6 +141,10 @@ them. Press **Record trace**: ruvo records an execution trace of the target for
 The graph shows up to 40 groups: those at the ends of arrows first, then red
 ones, then the biggest; the rest are in the list.
 
+Above the graph, a line says it in words: which group leaks or grows, which
+group is the jam and what it waits for, which of your groups slept through the
+whole trace. The list page has the same line without the arrows.
+
 **Record trace** records 5 seconds by default, at most once per 10 seconds;
 presses at the same time share one recording. It is the only thing that
 traces the target — ruvo never records on its own. While it records, a
@@ -176,6 +199,7 @@ Under the mount path (`/debug/ruvo/`; the flow page serves the same API under
 | `POST api/leaks` | run the `goroutineleak` profile |
 | `POST api/trace?seconds=N` | record a trace for N seconds (1 to 30, default 5); answers 404 unless a view that reads traces, like `flow.View()`, is mounted |
 | `GET api/export` | the session as a zip file (see [Save it](#save-it-and-show-a-colleague)) |
+| `GET api/metrics` | the snapshot as Prometheus metrics (see [Prometheus](#keep-the-numbers-in-prometheus)) |
 
 The POSTs return the new snapshot and refuse requests from other sites. A
 snapshot has:

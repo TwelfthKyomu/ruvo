@@ -196,6 +196,15 @@
             color: var(--muted);
         }
 
+        .summary {
+            margin: 0 0 12px;
+            padding: 10px 14px;
+            border: 1px solid var(--line);
+            border-radius: 8px;
+            background: var(--panel);
+            overflow-wrap: anywhere;
+        }
+
         .layout {
             display: grid;
             grid-template-columns: minmax(0, 1fr);
@@ -582,6 +591,7 @@
 </header>
 <div class="banner" id="banner"></div>
 <main>
+    <p class="summary" id="summary" hidden></p>
     <p class="hint" id="hint">Arrows show who wakes whom. Press Record trace to capture 5 seconds of the target.</p>
     <div class="layout" id="layout">
         <div class="wrap">
@@ -1285,8 +1295,46 @@
         header();
         const m = snap && (snap.groups || []).length ? model() : null;
         if (picked && (!m || !m.byId.has(picked))) picked = null;
+        const text = m ? summary(m) : "";
+        $("summary").textContent = text;
+        $("summary").hidden = !text;
         draw(m);
         panel(m);
+    }
+
+    function named(id, m) {
+        const g = m.byId.get(id);
+        return g ? short(split(g.waitSite).fn) : id;
+    }
+
+    function summary(m) {
+        const out = [];
+        const groups = snap.groups || [];
+        const most = (key, mine) => groups.filter((g) => g[key] > 0 && (!mine || !g.std)).sort((a, b) => b[key] - a[key])[0];
+        const name = (g) => short(split(g.waitSite).fn);
+        const told = new Set();
+        const leaked = most("leaked");
+        if (leaked) {
+            const rising = leaked.growthPerMin > 0 ? ", growing " + grow(leaked.growthPerMin) + "/min" : "";
+            out.push(name(leaked) + ": " + count(leaked.leaked) + " goroutines blocked forever" + rising + ".");
+            told.add(leaked.id);
+        }
+        if (m.jam && !told.has(m.jam)) {
+            const g = m.byId.get(m.jam);
+            let top = null;
+            for (const e of m.stats.get(m.jam).ins) if (!top || (e.wait || 0) > (top.wait || 0)) top = e;
+            const source = !top ? "" : top.from === top.to ? "each other" : top.from === "network" || top.from === "timer" ? "the " + top.from : named(top.from, m);
+            if (top) out.push("Jam: " + name(g) + " ×" + count(g.count) + " wait mostly for " + source + " (" + handoff(top) + ").");
+            told.add(m.jam);
+        }
+        const growing = most("growthPerMin");
+        if (growing && !told.has(growing.id)) {
+            out.push(name(growing) + " grows " + grow(growing.growthPerMin) + "/min.");
+            told.add(growing.id);
+        }
+        const stuck = most("unwoken", true);
+        if (stuck && !told.has(stuck.id)) out.push(name(stuck) + ": " + count(stuck.unwoken) + " goroutines slept through the whole trace — nothing woke them.");
+        return out.slice(0, 3).join(" ");
     }
 
     function toggle(id) {
