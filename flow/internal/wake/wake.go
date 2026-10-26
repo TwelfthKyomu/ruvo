@@ -42,6 +42,7 @@ type goroutine struct {
 	reason  string
 	since   trace.Time
 	home    *stack
+	woke    int
 }
 
 type edgeKey struct {
@@ -56,13 +57,15 @@ type edge struct {
 }
 
 type wakeup struct {
-	id     trace.GoID
-	waker  *stack
-	cause  string
-	reason string
-	since  trace.Time
-	at     trace.Time
-	later  bool
+	id        trace.GoID
+	waiter    *stack
+	waker     *stack
+	wakerFrom int
+	cause     string
+	reason    string
+	since     trace.Time
+	at        trace.Time
+	later     bool
 }
 
 type parser struct {
@@ -206,10 +209,7 @@ func (a *parser) block(g *goroutine, s *stack, reason string, since trace.Time) 
 
 	g.blocked, g.system = true, false
 	g.wait, g.reason, g.since = s, reason, since
-
-	if s != nil {
-		g.home = s
-	}
+	g.home, g.woke = s, 0
 }
 
 func (a *parser) rangeEvent(ev trace.Event) {
@@ -233,26 +233,33 @@ func (a *parser) wake(id trace.GoID, ev trace.Event) {
 		return
 	}
 
-	waiter := g.wait
-	w := wakeup{id: id, cause: ruvo.CauseTimer, reason: g.reason, since: g.since, at: ev.Time()}
+	w := wakeup{id: id, waiter: g.wait, cause: ruvo.CauseTimer, reason: g.reason, since: g.since, at: ev.Time(), later: a.syncs > 1}
 	g.blocked, g.wait, g.reason, g.since = false, nil, "", 0
 
 	if wg := ev.Goroutine(); wg != trace.NoGoroutine {
-		if w.waker = a.waker(wg, ev); w.waker == nil || w.waker.system {
-			return
+		w.cause = ruvo.CauseGoroutine
+		w.waker, w.wakerFrom = a.waker(wg)
+
+		if w.waker == nil {
+			w.waker = a.fromTrace(ev.Stack())
 		}
 
-		w.cause = ruvo.CauseGoroutine
+		if w.wakerFrom == 0 && (w.waker == nil || w.waker.system) {
+			return
+		}
 	}
 
-	if waiter == nil {
-		w.later = a.syncs > 1
+	if w.waiter == nil || w.wakerFrom > 0 {
 		a.pending = append(a.pending, w)
+
+		if w.waiter == nil {
+			g.woke = len(a.pending)
+		}
 
 		return
 	}
 
-	a.record(w, waiter)
+	a.record(w, w.waiter, w.waker)
 }
 
 func (a *parser) dumpedWait(id trace.GoID, since, until trace.Time) *stack {
@@ -264,9 +271,26 @@ func (a *parser) dumpedWait(id trace.GoID, since, until trace.Time) *stack {
 }
 
 func (a *parser) settle() {
+	for i := range a.pending {
+		if w := &a.pending[i]; w.waiter == nil {
+			w.waiter = a.dumpedWait(w.id, w.since, w.at)
+		}
+	}
+
 	for _, w := range a.pending {
-		waiter := a.dumpedWait(w.id, w.since, w.at)
-		if waiter == nil {
+		waker := w.waker
+
+		if w.wakerFrom > 0 {
+			if s := a.pending[w.wakerFrom-1].waiter; s != nil {
+				waker = s
+			}
+
+			if waker == nil || waker.system {
+				continue
+			}
+		}
+
+		if w.waiter == nil {
 			a.unknown[w.cause]++
 
 			if w.later {
@@ -276,11 +300,11 @@ func (a *parser) settle() {
 			continue
 		}
 
-		a.record(w, waiter)
+		a.record(w, w.waiter, waker)
 	}
 }
 
-func (a *parser) record(w wakeup, waiter *stack) {
+func (a *parser) record(w wakeup, waiter, waker *stack) {
 	if waiter.system {
 		return
 	}
@@ -290,7 +314,7 @@ func (a *parser) record(w wakeup, waiter *stack) {
 		cause = ruvo.CauseNetwork
 	}
 
-	k := edgeKey{cause: cause, waker: w.waker, waiter: waiter}
+	k := edgeKey{cause: cause, waker: waker, waiter: waiter}
 
 	e := a.edges[k]
 	if e == nil {
@@ -336,16 +360,17 @@ func (a *parser) stuck() {
 	}
 }
 
-func (a *parser) waker(id trace.GoID, ev trace.Event) *stack {
-	if g := a.gs[id]; g != nil && g.home != nil {
-		return g.home
+func (a *parser) waker(id trace.GoID) (*stack, int) {
+	g := a.gs[id]
+
+	switch {
+	case g == nil:
+		return nil, 0
+	case g.home != nil:
+		return g.home, 0
 	}
 
-	if s := a.fromDump(id); s != nil {
-		return s
-	}
-
-	return a.fromTrace(ev.Stack())
+	return nil, g.woke
 }
 
 func (a *parser) fromDump(id trace.GoID) *stack {

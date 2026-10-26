@@ -3,6 +3,7 @@ package dump
 import (
 	"bytes"
 	"fmt"
+	"math"
 	"strconv"
 	"strings"
 )
@@ -49,22 +50,31 @@ func parseFileLine(s []byte) ([]byte, int, bool) {
 	return s[:i], n, true
 }
 
-func atoi(b []byte) (int, bool) {
+func atoi64(b []byte) (int64, bool) {
 	if len(b) == 0 || len(b) > 18 {
 		return 0, false
 	}
 
-	n := 0
+	var n int64
 
 	for _, c := range b {
 		if c < '0' || c > '9' {
 			return 0, false
 		}
 
-		n = n*10 + int(c-'0')
+		n = n*10 + int64(c-'0')
 	}
 
 	return n, true
+}
+
+func atoi(b []byte) (int, bool) {
+	n, ok := atoi64(b)
+	if !ok || n > math.MaxInt {
+		return 0, false
+	}
+
+	return int(n), true
 }
 
 func signedAtoi(b []byte) (int, bool) {

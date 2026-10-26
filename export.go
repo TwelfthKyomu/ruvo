@@ -18,9 +18,8 @@ import (
 )
 
 const (
-	sessionFormat  = 1
-	sessionFileMax = 128 << 20
-	modulePath     = "github.com/TwelfthKyomu/ruvo"
+	sessionFormat = 1
+	modulePath    = "github.com/TwelfthKyomu/ruvo"
 
 	fileReadme    = "README.txt"
 	fileSession   = "session.json"
@@ -33,6 +32,11 @@ const (
 )
 
 var rawFiles = []string{fileStacks, fileFull, fileLeaks, fileTrace, fileTraceFull}
+
+var sessionLimits = struct {
+	file  int64
+	total int64
+}{file: 80 << 20, total: 320 << 20}
 
 type session struct {
 	info sessionInfo
@@ -316,14 +320,18 @@ func readSession(r io.ReaderAt, size int64) (session, error) {
 		files[f.Name] = f
 	}
 
+	var total int64
+
 	read := func(name string) ([]byte, error) {
 		f, ok := files[name]
 		if !ok {
 			return nil, fmt.Errorf("not a ruvo session: no %s", name)
 		}
 
-		if f.UncompressedSize64 > sessionFileMax {
-			return nil, fmt.Errorf("ruvo session: %s is larger than %d bytes", name, sessionFileMax)
+		limit := min(sessionLimits.file, sessionLimits.total-total)
+
+		if f.UncompressedSize64 > uint64(limit) {
+			return nil, fmt.Errorf("ruvo session: %s is too large", name)
 		}
 
 		rc, err := f.Open()
@@ -333,14 +341,16 @@ func readSession(r io.ReaderAt, size int64) (session, error) {
 
 		defer rc.Close()
 
-		b, err := io.ReadAll(io.LimitReader(rc, sessionFileMax+1))
+		b, err := io.ReadAll(io.LimitReader(rc, limit+1))
 		if err != nil {
 			return nil, fmt.Errorf("ruvo session: %s: %w", name, err)
 		}
 
-		if len(b) > sessionFileMax {
-			return nil, fmt.Errorf("ruvo session: %s is larger than %d bytes", name, sessionFileMax)
+		if int64(len(b)) > limit {
+			return nil, fmt.Errorf("ruvo session: %s is too large", name)
 		}
+
+		total += int64(len(b))
 
 		return b, nil
 	}
@@ -369,11 +379,18 @@ func readSession(r io.ReaderAt, size int64) (session, error) {
 	}
 
 	kept := s.info.Files[:0]
+	seen := map[string]bool{}
 
 	for _, f := range s.info.Files {
 		if !slices.Contains(rawFiles, f.Name) {
 			continue
 		}
+
+		if seen[f.Name] {
+			return session{}, fmt.Errorf("ruvo session: %s lists %s twice", fileSession, f.Name)
+		}
+
+		seen[f.Name] = true
 
 		if f.data, err = read(f.Name); err != nil {
 			return session{}, err

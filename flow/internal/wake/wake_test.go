@@ -881,3 +881,81 @@ func BenchmarkRead(b *testing.B) {
 		}
 	}
 }
+
+func xReceiver(x <-chan int) {
+	<-x
+}
+
+func wakeThenWait(a, b <-chan struct{}, x chan<- int) {
+	waitOnA(a)
+	x <- 1
+	waitOnB(b)
+}
+
+func TestWakerFutureDumpIsNotUsed(t *testing.T) {
+	a, b, x := make(chan struct{}), make(chan struct{}), make(chan int)
+	defer close(b)
+
+	go wakeThenWait(a, b, x)
+	time.Sleep(10 * time.Millisecond)
+
+	stacks := map[int64][]ruvo.Frame{}
+
+	data := capture(t, func() {
+		go xReceiver(x)
+		time.Sleep(25 * time.Millisecond)
+		close(a)
+		time.Sleep(175 * time.Millisecond)
+
+		for _, id := range waiting("wake.waitOnB", "github.com/TwelfthKyomu/ruvo/flow/internal/wake.TestWakerFutureDumpIsNotUsed") {
+			stacks[id] = []ruvo.Frame{{Func: "x.atB", File: "/home/dev/p.go", Line: 2}}
+		}
+
+		time.Sleep(20 * time.Millisecond)
+	})
+
+	if len(stacks) != 1 {
+		t.Fatalf("found %d goroutines waiting on B in the dump, want 1", len(stacks))
+	}
+
+	ws, _ := parse(t, data, stacks)
+
+	w, ok := find(ws, ruvo.CauseGoroutine, "", "wake.xReceiver")
+	if !ok || has(w.Waker, "x.atB") || !has(w.Waker, "wake.wakeThenWait") {
+		t.Fatalf("waker of the receiver: %s (found %v): it must not come from a dump taken after the wakeup%s", trail(w.Waker), ok, top(ws))
+	}
+}
+
+func TestWakerWaitFromEarlierDump(t *testing.T) {
+	a, b, x := make(chan struct{}), make(chan struct{}), make(chan int)
+	defer close(b)
+
+	go wakeThenWait(a, b, x)
+	time.Sleep(10 * time.Millisecond)
+
+	stacks := map[int64][]ruvo.Frame{}
+
+	data := capture(t, func() {
+		go xReceiver(x)
+		time.Sleep(10 * time.Millisecond)
+
+		for _, id := range waiting("wake.waitOnA", "github.com/TwelfthKyomu/ruvo/flow/internal/wake.TestWakerWaitFromEarlierDump") {
+			stacks[id] = []ruvo.Frame{{Func: "x.atA", File: "/home/dev/p.go", Line: 1}}
+		}
+
+		time.Sleep(90 * time.Millisecond)
+		close(a)
+		time.Sleep(20 * time.Millisecond)
+	})
+
+	if len(stacks) != 1 {
+		t.Fatalf("found %d goroutines waiting on A in the dump, want 1", len(stacks))
+	}
+
+	ws, _ := parse(t, data, stacks)
+
+	w, ok := find(ws, ruvo.CauseGoroutine, "", "wake.xReceiver")
+	if !ok || !has(w.Waker, "x.atA") {
+		t.Fatalf("waker of the receiver: %s (found %v): the dump proves where it last waited%s", trail(w.Waker), ok, top(ws))
+	}
+}

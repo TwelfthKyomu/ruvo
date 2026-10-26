@@ -2,8 +2,10 @@ package dump
 
 import (
 	"bytes"
+	"math"
 	"os"
 	"reflect"
+	"strconv"
 	"testing"
 	"time"
 )
@@ -277,4 +279,23 @@ func FuzzParseStacks(f *testing.F) {
 			t.Fatalf("records hold %d goroutines, total says %d", sum, p.Total)
 		}
 	})
+}
+
+func TestParseFullIDsBeyond32Bits(t *testing.T) {
+	body := "goroutine 4294967297 [select]:\nmain.f()\n\t/app/main.go:3 +0x1\ncreated by main.main in goroutine 4294967298\n\t/app/main.go:9 +0x2\n"
+
+	gs, err := ParseFull([]byte(body))
+	if err != nil || len(gs) != 1 || gs[0].ID != 4294967297 || gs[0].Creator != 4294967298 {
+		t.Fatalf("goroutines %+v, err %v", gs, err)
+	}
+}
+
+func TestAtoiStaysInRange(t *testing.T) {
+	if n, ok := atoi64([]byte("999999999999999999")); !ok || n != 999999999999999999 {
+		t.Fatalf("atoi64: %d, %v", n, ok)
+	}
+
+	if n, ok := atoi([]byte("4294967297")); ok != (math.MaxInt > 4294967297) || ok && int64(n) != 4294967297 {
+		t.Fatalf("atoi: %d, %v with %d-bit int", n, ok, strconv.IntSize)
+	}
 }

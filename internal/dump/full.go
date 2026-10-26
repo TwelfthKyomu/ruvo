@@ -129,7 +129,7 @@ func splitHeader(line []byte) (id int64, rest []byte, ok bool) {
 		return 0, nil, false
 	}
 
-	n, _ := atoi(rest[:i])
+	n, _ := atoi64(rest[:i])
 	rest = rest[i:]
 
 	if !bytes.HasPrefix(rest, []byte(" [")) && !bytes.HasPrefix(rest, []byte(" gp=")) {
@@ -141,7 +141,7 @@ func splitHeader(line []byte) (id int64, rest []byte, ok bool) {
 		return 0, nil, false
 	}
 
-	return int64(n), rest[j+2:], true
+	return n, rest[j+2:], true
 }
 
 func (p *fullParser) header(id int64, rest []byte) {
@@ -192,8 +192,8 @@ func (p *fullParser) createdBy(line []byte) {
 
 	p.cur.CreatedBy = Frame{Func: p.in.str(fn)}
 
-	if n, ok := atoi(bytes.TrimSpace(id)); ok {
-		p.cur.Creator = int64(n)
+	if n, ok := atoi64(bytes.TrimSpace(id)); ok {
+		p.cur.Creator = n
 	}
 
 	p.created = true

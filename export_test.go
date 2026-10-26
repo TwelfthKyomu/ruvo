@@ -299,3 +299,69 @@ func TestSessionFileName(t *testing.T) {
 		}
 	}
 }
+
+func manifestZip(t *testing.T, names []string, sizes map[string]int) []byte {
+	t.Helper()
+
+	var b bytes.Buffer
+
+	zw := zip.NewWriter(&b)
+
+	put := func(name string, data []byte) {
+		w, err := zw.Create(name)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		w.Write(data)
+	}
+
+	put(fileSnapshot, []byte(`{"target":"x"}`))
+
+	for name, n := range sizes {
+		put(name, make([]byte, n))
+	}
+
+	files := make([]sessionFile, len(names))
+	for i, name := range names {
+		files[i] = sessionFile{Name: name}
+	}
+
+	info, _ := json.Marshal(sessionInfo{Format: sessionFormat, Files: files})
+	put(fileSession, info)
+	zw.Close()
+
+	return b.Bytes()
+}
+
+func TestOpenSessionRejectsRepeatedFiles(t *testing.T) {
+	b := manifestZip(t, []string{fileStacks, fileStacks, fileStacks}, map[string]int{fileStacks: 1 << 20})
+
+	if _, err := readSession(bytes.NewReader(b), int64(len(b))); err == nil || !strings.Contains(err.Error(), "twice") {
+		t.Fatalf("err %v: a file listed many times must not be unpacked many times", err)
+	}
+}
+
+func TestOpenSessionLimitsSize(t *testing.T) {
+	limits := sessionLimits
+	t.Cleanup(func() { sessionLimits = limits })
+
+	sessionLimits.file, sessionLimits.total = 1<<20, 3<<20
+
+	for name, tc := range map[string]struct {
+		names []string
+		sizes map[string]int
+		ok    bool
+	}{
+		"fits":      {[]string{fileStacks, fileFull}, map[string]int{fileStacks: 1 << 20, fileFull: 1 << 20}, true},
+		"file":      {[]string{fileFull}, map[string]int{fileFull: 1<<20 + 1}, false},
+		"total":     {[]string{fileStacks, fileFull, fileLeaks}, map[string]int{fileStacks: 1 << 20, fileFull: 1 << 20, fileLeaks: 1 << 20}, false},
+		"snapshots": {nil, nil, true},
+	} {
+		b := manifestZip(t, tc.names, tc.sizes)
+
+		if _, err := readSession(bytes.NewReader(b), int64(len(b))); (err == nil) != tc.ok {
+			t.Errorf("%s: err %v, want ok %v", name, err, tc.ok)
+		}
+	}
+}
